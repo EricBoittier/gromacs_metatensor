@@ -906,9 +906,13 @@ int32_t MetatomicForceProvider::exchangeBackwardGhosts(
         const int npulseD   = dd->numPulses[dimIndex];
 
         // The number of pulses needed to cover the "backward gap" left by GROMACS.
-        // GROMACS covers npulseD in the forward direction. The remaining domains
-        // in that dimension must be filled by us.
-        const int backwardGap = numCellsD - 1 - npulseD;
+        // GROMACS covers npulseD cells in the forward direction only, so the
+        // atoms within the cutoff behind the lower cell boundary always need
+        // npulseD backward pulses, even when (with two cells) the backward
+        // neighbour is the same rank as the forward one: those are different
+        // atoms, on the other side of the cell. Keep the old count, all
+        // domains not covered forward, as a lower bound.
+        const int backwardGap = std::max(numCellsD - 1 - npulseD, numCellsD > 1 ? npulseD : 0);
         if (backwardGap <= 0)
         {
             continue;
