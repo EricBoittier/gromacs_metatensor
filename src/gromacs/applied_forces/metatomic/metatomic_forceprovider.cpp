@@ -226,12 +226,12 @@ static IVec minimumImageCellShift(const matrix boxInv, PbcType pbcType, const RV
     return shift;
 }
 
-//! Cartesian shift vector of an integer cell shift.
+//! Cartesian shift n_a a + n_b b + n_c c of an integer cell shift (box rows are the box vectors).
 static RVec cellShiftVector(const matrix box, const IVec& cellShift)
 {
-    RVec shift;
-    mvmul_ur0(box, cellShift.toRVec(), shift);
-    return shift;
+    return { cellShift[XX] * box[XX][XX] + cellShift[YY] * box[YY][XX] + cellShift[ZZ] * box[ZZ][XX],
+             cellShift[YY] * box[YY][YY] + cellShift[ZZ] * box[ZZ][YY],
+             cellShift[ZZ] * box[ZZ][ZZ] };
 }
 
 //! Position of a cap at `linkDistance` from the embedded atom, towards the (shifted) MM atom.
