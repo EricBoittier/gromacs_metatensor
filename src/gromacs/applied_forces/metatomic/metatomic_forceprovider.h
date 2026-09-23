@@ -88,9 +88,19 @@ class MpiComm;
  * autograd here. Since ForceWithVirial is not communicated by dd_move_f,
  * home forces are applied directly and non-home (halo) forces are exchanged
  * via sparse indexed communication (allgatherv pattern). Falls back to dense
- * allreduce for small systems (N_total_mta < 1000). An ONIOM link cap
- * overwrites one DLPack row before the call; `spreadForce` then splits that
- * atom's gradient onto the embedded atom and the real MM atom.
+ * allreduce for small systems (N_total_mta < 1000).
+ *
+ * ## ONIOM link caps
+ *
+ * With `metatomic-oniom`, every ML/MM bond cut by the model region gets a
+ * hydrogen cap on the embedded-to-MM bond, at `linkDistance` from the
+ * embedded atom. The first cap on a boundary MM atom replaces that atom's
+ * row in the model input; further caps on the same MM atom get extra rows
+ * after the local atoms. Pairs involving cap rows are rebuilt from the cap
+ * positions (minimum image), since the GROMACS pairlist only knows the MM
+ * atom. The cap force is spread onto the embedded and MM atoms with the
+ * exact chain rule (`spreadLinkAtomForce`), and the virial gets the matching
+ * correction for the cap's fixed bond length.
  *
  * **Shift convention**: GROMACS shifts atom I (first):
  * d = x[I]+shift - x[J]. Metatensor convention: r_ij = x[J] + cell_shift*box
@@ -118,12 +128,11 @@ public:
     //! Store GROMACS pairlist and convert to MTA model indices.
     void setPairlist(const MDModulesPairlistConstructedSignal& signal);
 
-    /*! \brief ONIOM link caps in model-index space.
+    /*! \brief Replace the ONIOM link frontier (global atom indices).
      *
-     * Each entry's input indices are model indices. Before `execute_model`
-     * the MM row is replaced by the hydrogen cap. After the positions
-     * gradient is accumulated, `LinkFrontierAtom::spreadForce` splits that
-     * row onto the embedded atom and the MM atom. Empty means no caps.
+     * The constructor takes the frontier built by the ONIOM topology
+     * preprocessing (MetatomicParameters::linkFrontier_); this overrides it.
+     * Empty means no caps.
      */
     void setLinkFrontiers(std::vector<LinkFrontierAtom> frontiers);
 
@@ -237,7 +246,7 @@ private:
     std::vector<int32_t> nlSamplesBuffer_; //!< flat [n_pairs * 5]: i, j, cs_a, cs_b, cs_c
     std::vector<double>  nlVectorsBuffer_; //!< flat [n_pairs * 3]: dx, dy, dz
 
-    //! ONIOM caps. Input indices are model indices. Empty unless set.
+    //! ONIOM link frontier, in global atom indices. Resolved to model rows every step.
     std::vector<LinkFrontierAtom> linkFrontiers_;
 
     //! local copy of simulation box

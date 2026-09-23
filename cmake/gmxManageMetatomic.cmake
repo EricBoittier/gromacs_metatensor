@@ -47,7 +47,9 @@ if(NOT GMX_METATOMIC STREQUAL "OFF")
     # CMAKE_PREFIX_PATH.
     # metatomic-config calls find_package(metatensor REQUIRED). Resolve
     # metatensor first so a missing dependency stays a soft failure in AUTO.
-    find_package(metatensor 0.3.0 CONFIG QUIET)
+    # metatensor-core 0.3.0 has never been released; metatomic-core itself
+    # requires 0.2.4 (REQUIRED_METATENSOR_VERSION), so match that floor.
+    find_package(metatensor 0.2.4 CONFIG QUIET)
     if(metatensor_FOUND)
         find_package(metatomic CONFIG QUIET)
     endif()
