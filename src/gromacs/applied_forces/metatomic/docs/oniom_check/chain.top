@@ -1,0 +1,42 @@
+[ defaults ]
+; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ
+  1       2          no         1.0      1.0
+
+[ atomtypes ]
+; name  at.num  mass     charge  ptype  sigma  epsilon
+  CT    6       12.011   0.0     A      0.30   0.0
+  OT    8       15.999   0.0     A      0.30   0.0
+
+[ moleculetype ]
+chain  3
+
+[ atoms ]
+;  nr  type  resnr  res  atom  cgnr  charge   mass
+   1   CT    1      MOL  C0    1      0.30    12.011
+   2   CT    1      MOL  C1    2     -0.20    12.011
+   3   OT    1      MOL  O2    3     -0.40    15.999
+   4   CT    1      MOL  C3    4      0.25    12.011
+   5   CT    1      MOL  C4    5      0.15    12.011
+   6   CT    1      MOL  C5    6     -0.30    12.011
+   7   CT    1      MOL  C6    7      0.20    12.011
+
+[ bonds ]
+  1 2 1 0.150 200000
+  2 3 1 0.140 200000
+  3 4 1 0.140 200000
+  4 5 1 0.150 200000
+  5 6 1 0.150 200000
+  2 7 1 0.150 200000
+  4 7 1 0.150 200000
+
+[ angles ]
+  1 2 3 1 109.5 400
+  2 3 4 1 109.5 400
+  3 4 5 1 109.5 400
+  4 5 6 1 109.5 400
+
+[ system ]
+ONIOM link-atom test chain
+
+[ molecules ]
+chain 1
