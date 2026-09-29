@@ -1575,7 +1575,11 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
 
                     // Compute shift vector from cell shift and current box
                     RVec shift;
-                    mvmul_ur0(inputs.box_, cellShiftsMta_[k].toRVec(), shift);
+                    const IVec& n = cellShiftsMta_[k];
+                    shift[XX] = n[XX] * inputs.box_[XX][XX] + n[YY] * inputs.box_[YY][XX]
+                                + n[ZZ] * inputs.box_[ZZ][XX];
+                    shift[YY] = n[YY] * inputs.box_[YY][YY] + n[ZZ] * inputs.box_[ZZ][YY];
+                    shift[ZZ] = n[ZZ] * inputs.box_[ZZ][ZZ];
 
                     // Displacement: r_ij = pos[j] - pos[i] + shift  (metatensor convention)
                     const double dx = static_cast<double>(positions_[aj][0] - positions_[ai][0] + shift[0]);
@@ -1831,7 +1835,8 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                                           * (inputs.box_[YY][XX] * inputs.box_[ZZ][YY]
                                              - inputs.box_[YY][YY] * inputs.box_[ZZ][XX]);
 
-                virialTensor = (-stress_tensor * volume)
+                // 1/2 for GROMACS' virial convention
+                virialTensor = (0.5 * stress_tensor * volume)
                                        .to(torch::kCPU).to(torch::kFloat64);
             }
             else
@@ -1858,8 +1863,9 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
 
             MetatomicTimer toCPUTimer("toCPU", mpiComm_);
 
-            forceTensor  = torch_positions.grad().to(torch::kCPU).to(torch::kFloat64);
-            virialTensor = strain.grad().to(torch::kCPU).to(torch::kFloat64);
+            forceTensor = torch_positions.grad().to(torch::kCPU).to(torch::kFloat64);
+            // 1/2 for GROMACS' virial convention; "-" since backward ran on -E
+            virialTensor = (-0.5 * strain.grad()).to(torch::kCPU).to(torch::kFloat64);
 
             toCPUTimer.stop();
         }
