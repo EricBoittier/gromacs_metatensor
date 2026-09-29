@@ -46,3 +46,29 @@ This check found two bugs, fixed on this branch: the lattice shift of pairs in
 sheared boxes (`box * n` instead of `box^T * n`), and missing backward ghosts
 with two domain-decomposition cells. Without the cap virial correction, the
 virial is off by up to 39 kJ/mol here (Vir-XX -1.13 instead of 37.75).
+
+## ML region wider than rcoulomb
+
+`check_wide_ml.py` runs a 6-atom ML rod (1.3 nm, `rod.top`, `rod.ndx`) among
+four MM ions, with rcoulomb set just below the distance of ML atoms 0 and 3,
+so the finite-difference and strain frames move that pair across the
+cut-off. With PME it also checks that the Coulomb energy (SR + reciprocal)
+matches a run with rcoulomb = 1.6 nm, where every ML pair is within the
+cut-off.
+
+```bash
+python check_wide_ml.py --gmx build/bin/gmx --plugin libpair_model.so --coulomb pme
+python check_wide_ml.py --gmx build/bin/gmx --plugin libpair_model.so --coulomb rf --ranks 2
+```
+
+| configuration | Coulomb energy vs rcoulomb = 1.6 nm | max force error | virial |
+| --- | --- | --- | --- |
+| PME, serial | -124.8170 / -124.8124 | 0.25 kJ/mol/nm (forces up to 161) | within 0.09 |
+| PME, 2 ranks | -124.8147 / -124.8124 | 0.15 | within 0.05 |
+| RF, serial | | 0.009 (forces up to 150) | within 0.003 |
+| RF, 2 ranks | | 0.006 | within 0.007 |
+
+Without the embedded Coulomb correction, the PME energy is off by 51 kJ/mol
+(the ML pairs beyond rcoulomb keep their MM interaction), and with both PME
+and RF the forces are off by 8000 kJ/mol/nm where the pair crosses the
+cut-off.

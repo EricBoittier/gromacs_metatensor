@@ -36,6 +36,7 @@ gmx_add_unit_test(MTAAppliedForcesUnitTest mta_applied_forces-test
         # metatomic_forceprovider.cpp
         metatomic_options.cpp
         c_api_contract.cpp
+        embedded_coulomb_correction.cpp
 )
 
 target_link_libraries(mta_applied_forces-test PRIVATE applied_forces math topology)
