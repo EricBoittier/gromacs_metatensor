@@ -121,6 +121,10 @@ struct MetatomicParameters
     std::vector<LinkFrontierAtom> linkFrontier_;
     //! Topology charges indexed by global atom
     std::vector<real>             mmCharges_;
+    //! Energy group of every atom, from the simulation topology
+    std::vector<int> energyGroups_;
+    //! Number of energy groups
+    int numEnergyGroups_ = 1;
 };
 
 class MetatomicOptions final : public IMdpOptionProvider

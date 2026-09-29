@@ -27,6 +27,18 @@ removed from the classical force-field contribution, while the model energy is
 added through the Metatomic force provider. Boundary bonded terms involving
 both Metatomic and MM atoms remain in the molecular-mechanics topology.
 
+All embedded atoms are mutually excluded from the classical non-bonded
+interactions. The non-bonded kernels treat excluded pairs within
+:mdp:`rcoulomb` only, so the remaining classical Coulomb interaction between
+embedded atoms is removed separately, for pairs at any distance: with Ewald
+and PME electrostatics, the reciprocal-space interaction
+:math:`q_i q_j \mathrm{erf}(\beta r)/r` of pairs beyond :mdp:`rcoulomb`;
+with reaction-field and plain cut-off electrostatics, the reaction-field term
+of excluded pairs within :mdp:`rcoulomb`. The embedded region may therefore
+be larger than :mdp:`rcoulomb`. This correction is reported in the
+Coulomb (SR) energy term; it evaluates all embedded pairs on every rank,
+which is intended for embedded regions of up to a few thousand atoms.
+
 Boundary link atoms
 -------------------
 
