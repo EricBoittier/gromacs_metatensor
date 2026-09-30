@@ -109,6 +109,13 @@ struct MetatomicParameters
     //! Enable ONIOM link atoms at cut bonds between ML and MM regions
     bool linkAtoms = false;
 
+    //! Index groups, one per ML site, each evaluated by the model as its own system
+    std::string siteGroups;
+    //! Total charge of each site (one value for all sites), for models that request it
+    std::string siteCharges;
+    //! Spin multiplicity of each site (one value for all sites), for models that request it
+    std::string siteSpinMultiplicities;
+
     std::vector<Index>            mtaIndices_;
     std::vector<Index>            mmIndices_;
     std::unique_ptr<LocalAtomSet> mtaAtoms_;
@@ -125,6 +132,15 @@ struct MetatomicParameters
     std::vector<int> energyGroups_;
     //! Number of energy groups
     int numEnergyGroups_ = 1;
+
+    //! Site of each atom in mtaIndices_ (all 0 without site groups)
+    std::vector<int> mtaSites_;
+    //! Total charge of each site
+    std::vector<real> siteChargeValues_;
+    //! Spin multiplicity of each site
+    std::vector<int> siteSpinValues_;
+    //! Number of sites
+    int numSites() const { return static_cast<int>(siteChargeValues_.size()); }
 };
 
 class MetatomicOptions final : public IMdpOptionProvider

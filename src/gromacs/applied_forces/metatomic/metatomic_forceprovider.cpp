@@ -137,10 +137,11 @@ static torch::Tensor preparePbcType(PbcType* pbcType, torch::Device device)
     return torch::tensor({ true, true, true }, options);
 }
 
-/*! \brief Whether a requested model input uses GROMACS atom charges. */
+/*! \brief Whether a requested model input is a charge (old name "charges", new name "charge"). */
 static bool isChargeInput(const std::string& name)
 {
-    return name == "charges" || name.rfind("charges/", 0) == 0;
+    return name == "charges" || name == "charge" || name.rfind("charges/", 0) == 0
+           || name.rfind("charge/", 0) == 0;
 }
 
 struct ActiveLinkAtom
@@ -218,6 +219,10 @@ struct MetatomicData
     torch::Device                                     device            = torch::kCPU;
     //! Requested Metatomic per-atom charge input names.
     std::vector<std::string> requestedChargeInputs;
+    //! Requested per-system total charge input names, filled from metatomic-site-charges.
+    std::vector<std::string> requestedSystemChargeInputs;
+    //! Requested per-system spin multiplicity input names, from metatomic-site-spin-multiplicities.
+    std::vector<std::string> requestedSpinInputs;
 
     //! Cached NL Labels that are identical every step (created once in constructor).
     metatensor_torch::Labels cachedNLComponent;
@@ -409,14 +414,55 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
     data_->evaluations_options = torch::make_intrusive<metatomic_torch::ModelEvaluationOptionsHolder>();
     data_->evaluations_options->set_length_unit("nm");
 
-    auto requestedInputs = data_->model.run_method("requested_inputs").toGenericDict();
-    for (const auto& entry : requestedInputs)
+    // Use the current input names (as metatomic-ase does); older models only have the old ones
+    c10::IValue requestedInputsValue;
+    try
     {
-        std::string inputName = entry.key().toStringRef();
-        if (isChargeInput(inputName))
+        requestedInputsValue = data_->model.run_method("requested_inputs", true);
+    }
+    catch (const std::exception&)
+    {
+        requestedInputsValue = data_->model.run_method("requested_inputs");
+    }
+    for (const auto& entry : requestedInputsValue.toGenericDict())
+    {
+        const std::string inputName = entry.key().toStringRef();
+        const auto option = entry.value().toCustomClass<metatomic_torch::ModelOutputHolder>();
+        const bool perSystem = option->sample_kind() == "system";
+        if (isChargeInput(inputName) && !perSystem)
         {
             data_->requestedChargeInputs.push_back(inputName);
         }
+        else if (isChargeInput(inputName))
+        {
+            data_->requestedSystemChargeInputs.push_back(inputName);
+        }
+        else if (inputName == "spin_multiplicity" && perSystem)
+        {
+            data_->requestedSpinInputs.push_back(inputName);
+        }
+        else
+        {
+            // Previously ignored, which failed later inside the model with a less clear error
+            GMX_THROW(NotImplementedError(formatString(
+                    "The model requests the input '%s' (per %s), which GROMACS does not provide. "
+                    "Supported inputs are per-atom charges (from the topology) and per-system "
+                    "charge and spin_multiplicity (metatomic-site-charges, "
+                    "metatomic-site-spin-multiplicities).",
+                    inputName.c_str(),
+                    option->sample_kind().c_str())));
+        }
+    }
+    if (!data_->requestedSystemChargeInputs.empty() || !data_->requestedSpinInputs.empty())
+    {
+        GMX_LOG(logger_.info)
+                .asParagraph()
+                .appendTextFormatted(
+                        "Metatomic: the model takes a total charge and/or spin multiplicity per "
+                        "system; %d ML site(s), charge %s, multiplicity %s",
+                        options_.params_.numSites(),
+                        formatAndJoin(options_.params_.siteChargeValues_, " ", StringFormatter("%g")).c_str(),
+                        formatAndJoin(options_.params_.siteSpinValues_, " ", StringFormatter("%d")).c_str());
     }
 
     auto outputs    = data_->capabilities->outputs();
@@ -1453,23 +1499,65 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             }
         }
 
-        auto system = torch::make_intrusive<metatomic_torch::SystemHolder>(
-                modelTypes, strained_positions, strained_cell, data_->cachedPbc);
+        // Site of every model atom; extra link caps belong to the site of their MM atom
+        const int numSites = options_.params_.numSites();
+        std::vector<int> siteOfModel(numModelAtoms, 0);
+        for (int32_t i = 0; i < numModelAtoms; ++i)
+        {
+            const int32_t source = i < numLocalMta_ ? i : modelChargeSourceModelIndex[i];
+            siteOfModel[i]       = options_.params_.mtaSites_[mtaToGlobalMta_[source]];
+        }
+        if (numSites > 1 && (useNewtonNL || data_->nonConservative))
+        {
+            GMX_THROW(NotImplementedError(
+                    "metatomic-site-groups with several sites needs a single rank and a "
+                    "conservative model."));
+        }
 
-        if (!data_->requestedChargeInputs.empty())
+        // Model atoms of each system: all of them, or the atoms of each site
+        std::vector<std::vector<int32_t>> systemAtoms(numSites > 1 ? numSites : 1);
+        std::vector<int32_t>              indexInSystem(numModelAtoms);
+        for (int32_t i = 0; i < numModelAtoms; ++i)
+        {
+            auto& atomsOfSystem = systemAtoms[numSites > 1 ? siteOfModel[i] : 0];
+            indexInSystem[i]    = static_cast<int32_t>(atomsOfSystem.size());
+            atomsOfSystem.push_back(i);
+        }
+
+        auto intOptions = torch::TensorOptions().dtype(torch::kInt32).device(data_->device);
+        // A per-system scalar input, as metatomic-ase makes it
+        const auto systemScalar = [&](double value, const std::string& property, const std::string& unit)
+        {
+            auto block = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
+                    torch::full({ 1, 1 }, value, torch::TensorOptions().dtype(data_->dtype).device(data_->device)),
+                    torch::make_intrusive<metatensor_torch::LabelsHolder>(
+                            std::vector<std::string>{ "system" }, torch::zeros({ 1, 1 }, intOptions)),
+                    std::vector<metatensor_torch::Labels>{},
+                    torch::make_intrusive<metatensor_torch::LabelsHolder>(
+                            std::vector<std::string>{ property }, torch::zeros({ 1, 1 }, intOptions)));
+            auto map = torch::make_intrusive<metatensor_torch::TensorMapHolder>(
+                    torch::make_intrusive<metatensor_torch::LabelsHolder>(
+                            std::vector<std::string>{ "_" }, torch::zeros({ 1, 1 }, intOptions)),
+                    std::vector<metatensor_torch::TensorBlock>{ block });
+            map->set_info("quantity", property);
+            map->set_info("unit", unit);
+            return map;
+        };
+        // Per-atom topology charges of the given model atoms
+        const auto atomCharges = [&](const std::vector<int32_t>& modelAtoms)
         {
             if (options_.params_.mmCharges_.empty())
             {
                 GMX_THROW(InconsistentInputError(
                         "Metatomic model requests charges, but topology charges are not available."));
             }
-
+            const int64_t     n = static_cast<int64_t>(modelAtoms.size());
             std::vector<real> chargeValues;
-            chargeValues.reserve(numModelAtoms);
-            for (int32_t i = 0; i < numModelAtoms; ++i)
+            chargeValues.reserve(n);
+            for (const int32_t i : modelAtoms)
             {
                 const int32_t sourceModelIndex = modelChargeSourceModelIndex[i];
-                const int32_t mtaIndex = mtaToGlobalMta_[sourceModelIndex];
+                const int32_t mtaIndex         = mtaToGlobalMta_[sourceModelIndex];
                 if (mtaIndex < 0
                     || mtaIndex >= static_cast<int32_t>(options_.params_.mtaIndices_.size()))
                 {
@@ -1487,21 +1575,17 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             }
 
             auto charges = torch::tensor(chargeValues, cpu_blob_options)
-                                   .reshape({ static_cast<int64_t>(numModelAtoms), 1 })
+                                   .reshape({ n, 1 })
                                    .to(data_->device, data_->dtype);
-            auto intOptions = torch::TensorOptions().dtype(torch::kInt32).device(data_->device);
-            auto samplesTensor = torch::zeros({ numModelAtoms, 2 }, intOptions);
-            samplesTensor.index_put_({ torch::indexing::Slice(), 1 },
-                                     torch::arange(numModelAtoms, intOptions));
+            auto samplesTensor = torch::zeros({ n, 2 }, intOptions);
+            samplesTensor.index_put_({ torch::indexing::Slice(), 1 }, torch::arange(n, intOptions));
 
             auto samples = torch::make_intrusive<metatensor_torch::LabelsHolder>(
                     std::vector<std::string>{ "system", "atom" }, samplesTensor);
             auto properties = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-                    std::vector<std::string>{ "charge" },
-                    torch::zeros({ 1, 1 }, intOptions));
+                    std::vector<std::string>{ "charge" }, torch::zeros({ 1, 1 }, intOptions));
             auto keys = torch::make_intrusive<metatensor_torch::LabelsHolder>(
-                    std::vector<std::string>{ "_" },
-                    torch::zeros({ 1, 1 }, intOptions));
+                    std::vector<std::string>{ "_" }, torch::zeros({ 1, 1 }, intOptions));
 
             auto block = torch::make_intrusive<metatensor_torch::TensorBlockHolder>(
                     charges, samples, std::vector<metatensor_torch::Labels>{}, properties);
@@ -1509,11 +1593,48 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                     keys, std::vector<metatensor_torch::TensorBlock>{ block });
             chargeMap->set_info("quantity", "charge");
             chargeMap->set_info("unit", "e");
+            return chargeMap;
+        };
 
-            for (const auto& inputName : data_->requestedChargeInputs)
+        std::vector<metatomic_torch::System> systems;
+        for (size_t s = 0; s < systemAtoms.size(); s++)
+        {
+            metatomic_torch::System systemS;
+            if (systemAtoms.size() == 1)
             {
-                system->add_data(inputName, chargeMap);
+                systemS = torch::make_intrusive<metatomic_torch::SystemHolder>(
+                        modelTypes, strained_positions, strained_cell, data_->cachedPbc);
             }
+            else
+            {
+                // A view of the site's rows keeps the autograd link to the full positions
+                const auto rows = torch::tensor(std::vector<int64_t>(systemAtoms[s].begin(), systemAtoms[s].end()),
+                                                torch::TensorOptions().dtype(torch::kInt64))
+                                          .to(data_->device);
+                systemS = torch::make_intrusive<metatomic_torch::SystemHolder>(
+                        modelTypes.index_select(0, rows),
+                        strained_positions.index_select(0, rows),
+                        strained_cell,
+                        data_->cachedPbc);
+            }
+            if (!data_->requestedChargeInputs.empty())
+            {
+                const auto chargeMap = atomCharges(systemAtoms[s]);
+                for (const auto& inputName : data_->requestedChargeInputs)
+                {
+                    systemS->add_data(inputName, chargeMap);
+                }
+            }
+            for (const auto& inputName : data_->requestedSystemChargeInputs)
+            {
+                systemS->add_data(inputName, systemScalar(options_.params_.siteChargeValues_[s], "charge", "e"));
+            }
+            for (const auto& inputName : data_->requestedSpinInputs)
+            {
+                systemS->add_data(inputName,
+                                  systemScalar(options_.params_.siteSpinValues_[s], "spin_multiplicity", ""));
+            }
+            systems.push_back(systemS);
         }
 
         tensorPrepTimer.stop();
@@ -1653,13 +1774,52 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 nPairs = static_cast<int64_t>(nlSamplesBuffer_.size() / 5);
             }
 
+            // With several systems, keep the pairs within each site, in site-local indices
+            std::vector<std::vector<int32_t>> systemSamples(systems.size());
+            std::vector<std::vector<double>>  systemVectors(systems.size());
+            if (systems.size() > 1)
+            {
+                for (int64_t k = 0; k < nPairs; k++)
+                {
+                    const int32_t ai = nlSamplesBuffer_[5 * k];
+                    const int32_t aj = nlSamplesBuffer_[5 * k + 1];
+                    const int     s  = siteOfModel[ai];
+                    if (siteOfModel[aj] != s)
+                    {
+                        continue;
+                    }
+                    systemSamples[s].insert(systemSamples[s].end(),
+                                            { indexInSystem[ai],
+                                              indexInSystem[aj],
+                                              nlSamplesBuffer_[5 * k + 2],
+                                              nlSamplesBuffer_[5 * k + 3],
+                                              nlSamplesBuffer_[5 * k + 4] });
+                    systemVectors[s].insert(systemVectors[s].end(),
+                                            nlVectorsBuffer_.begin() + 3 * k,
+                                            nlVectorsBuffer_.begin() + 3 * k + 3);
+                }
+            }
+
+          for (size_t s = 0; s < systems.size(); s++)
+          {
+            const auto& system        = systems[s];
+            int32_t*    samplesData   = nlSamplesBuffer_.data();
+            double*     vectorsData   = nlVectorsBuffer_.data();
+            int64_t     nPairsSystem  = nPairs;
+            if (systems.size() > 1)
+            {
+                samplesData  = systemSamples[s].data();
+                vectorsData  = systemVectors[s].data();
+                nPairsSystem = static_cast<int64_t>(systemSamples[s].size() / 5);
+            }
+
             // Wrap raw buffers as tensors (zero-copy on CPU, then move to device)
             MetatomicTimer fromBlobTimer("fromBlob", mpiComm_);
             auto samples_tensor = torch::from_blob(
-                    nlSamplesBuffer_.data(), { nPairs, 5 },
+                    samplesData, { nPairsSystem, 5 },
                     torch::TensorOptions().dtype(torch::kInt32)).to(data_->device);
             auto vectors_tensor = torch::from_blob(
-                    nlVectorsBuffer_.data(), { nPairs, 3, 1 },
+                    vectorsData, { nPairsSystem, 3, 1 },
                     torch::TensorOptions().dtype(torch::kFloat64)).to(data_->device, data_->dtype);
             fromBlobTimer.stop();
 
@@ -1693,6 +1853,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             MetatomicTimer addNLTimer("addNeighborList", mpiComm_);
             system->add_neighbor_list(request, neighbors);
             addNLTimer.stop();
+          }
         }
 
         buildNLTimer.stop();
@@ -1770,9 +1931,6 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         c10::IValue                 ivalue_output;
         try
         {
-            std::vector<metatomic_torch::System> systems;
-            systems.push_back(system);
-
             ivalue_output = data_->model.forward(
                     { systems, data_->evaluations_options, data_->check_consistency });
             auto dict_output = ivalue_output.toGenericDict();
