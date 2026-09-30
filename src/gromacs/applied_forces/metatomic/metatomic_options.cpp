@@ -102,6 +102,49 @@ void addLinkFrontierAtom(std::set<int>*                 boundaryMM,
     linkFrontier->emplace_back(embeddedIndex, mmIndex);
 }
 
+//! Returns the chemical bonds between an atom in \p mlSet and one outside it, as (ML, MM) pairs
+std::vector<std::pair<int, int>> findCutBonds(const gmx_mtop_t& mtop, const std::set<int>& mlSet)
+{
+    // This runs before splitEmbeddedBlocks, so a block may still hold many
+    // molecules of the same type (one block of 34 lipids, say). Every
+    // molecule in the block therefore has to be visited with its own atom
+    // offset: using only the block's globalAtomStart finds the boundary of
+    // the first molecule and silently misses all the others.
+    std::vector<std::pair<int, int>> cut;
+    for (size_t mb = 0; mb < mtop.molblock.size(); ++mb)
+    {
+        const auto& moltype     = mtop.moltype[mtop.molblock[mb].type];
+        const int   blockStart  = mtop.moleculeBlockIndices[mb].globalAtomStart;
+        const int   numAtomsMol = moltype.atoms.nr;
+
+        for (int mol = 0; mol < mtop.molblock[mb].nmol; ++mol)
+        {
+            const int start = blockStart + mol * numAtomsMol;
+
+            for (const auto ftype : gmx::EnumerationWrapper<InteractionFunction>{})
+            {
+                if (!(interaction_function[ftype].flags & IF_CHEMBOND) || NRAL(ftype) != 2
+                    || moltype.ilist[ftype].empty())
+                {
+                    continue;
+                }
+                for (int j = 0; j < moltype.ilist[ftype].size(); j += 3)
+                {
+                    const int  a1    = moltype.ilist[ftype].iatoms[j + 1] + start;
+                    const int  a2    = moltype.ilist[ftype].iatoms[j + 2] + start;
+                    const bool a1_ml = mlSet.count(a1) > 0;
+                    const bool a2_ml = mlSet.count(a2) > 0;
+                    if (a1_ml != a2_ml)
+                    {
+                        cut.emplace_back(a1_ml ? a1 : a2, a1_ml ? a2 : a1);
+                    }
+                }
+            }
+        }
+    }
+    return cut;
+}
+
 //! \brief Helper function to preprocess topology for MTA
 void preprocessTopology(gmx_mtop_t*                    mtop,
                         ArrayRef<const Index>           mtaIndices,
@@ -313,6 +356,24 @@ void MetatomicOptions::modifyTopology(gmx_mtop_t* top)
         return;
     }
 
+    if (!params_.linkAtoms && wi_ != nullptr)
+    {
+        const std::set<int> mlSet(params_.mtaIndices_.begin(), params_.mtaIndices_.end());
+        const auto          cut = findCutBonds(*top, mlSet);
+        if (!cut.empty())
+        {
+            wi_->addWarning(formatString(
+                    "%zu covalent bond(s) between ML and MM atoms are cut (the first between "
+                    "atoms %d and %d, 1-based), but metatomic-link-atoms = no. The model then "
+                    "sees the ML atoms at the cut with a missing neighbour (a dangling bond), "
+                    "which gives wrong energies and forces. Set metatomic-link-atoms = yes to "
+                    "cap them with hydrogens, or include the bonded MM atoms in the ML group.",
+                    cut.size(),
+                    cut.front().first + 1,
+                    cut.front().second + 1));
+        }
+    }
+
     if (params_.linkAtoms)
     {
         // NNPot-style: identify boundary MM atoms first (by scanning bonds
@@ -326,48 +387,10 @@ void MetatomicOptions::modifyTopology(gmx_mtop_t* top)
         // so we know which embedded atoms are "real ML" vs "boundary MM".
         std::set<int> origMtaSet(params_.mtaIndices_.begin(), params_.mtaIndices_.end());
 
-        // Scan bonds to find direct MM neighbors of ML atoms.
-        //
-        // This runs before splitEmbeddedBlocks, so a block may still hold many
-        // molecules of the same type (one block of 34 lipids, say). Every
-        // molecule in the block therefore has to be visited with its own atom
-        // offset: using only the block's globalAtomStart finds the boundary of
-        // the first molecule and silently misses all the others.
         std::set<int> boundaryMM;
-        for (size_t mb = 0; mb < top->molblock.size(); ++mb)
+        for (const auto& [embedded, mm] : findCutBonds(*top, origMtaSet))
         {
-            const auto& moltype     = top->moltype[top->molblock[mb].type];
-            const int   blockStart  = top->moleculeBlockIndices[mb].globalAtomStart;
-            const int   numAtomsMol = moltype.atoms.nr;
-
-            for (int mol = 0; mol < top->molblock[mb].nmol; ++mol)
-            {
-                const int start = blockStart + mol * numAtomsMol;
-
-                for (const auto ftype : gmx::EnumerationWrapper<InteractionFunction>{})
-                {
-                    if (!(interaction_function[ftype].flags & IF_CHEMBOND) || NRAL(ftype) != 2
-                        || moltype.ilist[ftype].empty())
-                    {
-                        continue;
-                    }
-                    for (int j = 0; j < moltype.ilist[ftype].size(); j += 3)
-                    {
-                        int  a1    = moltype.ilist[ftype].iatoms[j + 1] + start;
-                        int  a2    = moltype.ilist[ftype].iatoms[j + 2] + start;
-                        bool a1_ml = origMtaSet.count(a1) > 0;
-                        bool a2_ml = origMtaSet.count(a2) > 0;
-                        if (a1_ml && !a2_ml)
-                        {
-                            addLinkFrontierAtom(&boundaryMM, &params_.linkFrontier_, a1, a2);
-                        }
-                        else if (a2_ml && !a1_ml)
-                        {
-                            addLinkFrontierAtom(&boundaryMM, &params_.linkFrontier_, a2, a1);
-                        }
-                    }
-                }
-            }
+            addLinkFrontierAtom(&boundaryMM, &params_.linkFrontier_, embedded, mm);
         }
 
         // Add boundary MM atoms to the embedded set
