@@ -1006,6 +1006,48 @@ int32_t MetatomicForceProvider::exchangeBackwardGhosts(
 }
 
 
+int32_t MetatomicForceProvider::gatherAllMtaAtoms()
+{
+    const auto&   mtaIndices  = options_.params_.mtaIndices_;
+    const int32_t numTotalMta = static_cast<int32_t>(mtaIndices.size());
+
+    // Home atoms are owned by exactly one rank, so a sum of the home positions scattered
+    // into a dense array gives all positions.
+    std::vector<double> allPositions(3 * numTotalMta, 0.0);
+    for (int32_t i = 0; i < numHomeMta_; i++)
+    {
+        const int32_t g = mtaToGlobalMta_[i];
+        for (int d = 0; d < 3; d++)
+        {
+            allPositions[3 * g + d] = positions_[i][d];
+        }
+    }
+    mpiComm_.sumReduce(static_cast<std::size_t>(3 * numTotalMta), allPositions.data());
+
+    std::vector<bool> isLocal(numTotalMta, false);
+    for (int32_t i = 0; i < numLocalMta_; i++)
+    {
+        isLocal[mtaToGlobalMta_[i]] = true;
+    }
+
+    int32_t numAdded = 0;
+    for (int32_t g = 0; g < numTotalMta; g++)
+    {
+        if (isLocal[g])
+        {
+            continue;
+        }
+        positions_.push_back(RVec(static_cast<real>(allPositions[3 * g]),
+                                  static_cast<real>(allPositions[3 * g + 1]),
+                                  static_cast<real>(allPositions[3 * g + 2])));
+        atomNumbers_.push_back(options_.params_.atoms_.atom[mtaIndices[g]].atomnumber);
+        mtaToGlobalMta_.push_back(g);
+        numAdded++;
+    }
+    numLocalMta_ += numAdded;
+    return numAdded;
+}
+
 void MetatomicForceProvider::exchangeBackwardPairs(const matrix box, int maxRounds)
 {
     backwardPairsMta_.clear();
@@ -1024,13 +1066,6 @@ void MetatomicForceProvider::exchangeBackwardPairs(const matrix box, int maxRoun
     {
         myPairsBuf[2 * k]     = mtaToGlobalMta_[pairlistMta_[2 * k]];
         myPairsBuf[2 * k + 1] = mtaToGlobalMta_[pairlistMta_[2 * k + 1]];
-    }
-
-    // Step 2: Build set of my home atoms.
-    std::unordered_set<int32_t> myHomeGlobalMta;
-    for (int32_t i = 0; i < numHomeMta_; i++)
-    {
-        myHomeGlobalMta.insert(mtaToGlobalMta_[i]);
     }
 
     // Step 3: Existing canonical pairs — O(1) lookup via hashed set.
@@ -1096,13 +1131,8 @@ void MetatomicForceProvider::exchangeBackwardPairs(const matrix box, int maxRoun
             const int32_t gI = recvBuf[2 * k];
             const int32_t gJ = recvBuf[2 * k + 1];
 
-            const bool iIsMyHome = myHomeGlobalMta.count(gI) > 0;
-            const bool jIsMyHome = myHomeGlobalMta.count(gJ) > 0;
-            if (!iIsMyHome && !jIsMyHome)
-            {
-                continue;
-            }
-
+            // Keep pairs between two non-home atoms too: the environment of a non-home
+            // neighbor enters the home atom energy through message passing.
             auto canonical = std::make_pair(std::min(gI, gJ), std::max(gI, gJ));
             if (existingCanonical.count(canonical) > 0)
             {
@@ -1289,37 +1319,22 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             maxCutoff = std::max(maxCutoff, cutoff);
         }
 
-        // Step 1: Exchange backward ghost atoms to fill the backward gap
-        // in the DD halo.  Extends positions_, atomNumbers_, mtaToGlobalMta_
-        // and numLocalMta_ with atoms from the backward PBC neighbor.
+        GMX_UNUSED_VALUE(maxCutoff);
+        // Step 1: Make all MTA atoms local. The DD halo covers only the forward direction,
+        // while each home atom energy depends on all atoms within the model interaction
+        // range (message passing). Extends positions_, atomNumbers_, mtaToGlobalMta_ and
+        // numLocalMta_. (exchangeBackwardGhosts only covered a pairwise model.)
         {
-            MetatomicTimer timer("exchangeBackwardGhosts", mpiComm_);
-            exchangeBackwardGhosts(inputs.dd_, inputs.box_, maxCutoff);
+            MetatomicTimer timer("gatherAllMtaAtoms", mpiComm_);
+            gatherAllMtaAtoms();
         }
 
-        // Step 2: Exchange backward-direction pairs.  Discovers pairs from
-        // other ranks' pairlists that involve this rank's home atoms.
-        // Limit ring rounds to ceil(cutoff/minCellSize) when DD is available.
+        // Step 2: Collect the pairs of all other ranks' pairlists, including pairs between
+        // two non-home atoms. Every pair within the plain pairlist range is in exactly one
+        // rank's list, so a full ring gives every rank the complete list.
         {
             MetatomicTimer timer("exchangeBackwardPairs", mpiComm_);
-            int maxRounds = mpiComm_.size() - 1;
-            if (inputs.dd_ != nullptr && inputs.dd_->ndim > 0)
-            {
-                double minCellSize = 1e30;
-                for (int d = 0; d < inputs.dd_->ndim; d++)
-                {
-                    const int    dim = inputs.dd_->dim[d];
-                    const double cs  = static_cast<double>(inputs.box_[dim][dim])
-                                      / inputs.dd_->numCells[dim];
-                    minCellSize = std::min(minCellSize, cs);
-                }
-                if (minCellSize > 0.0)
-                {
-                    maxRounds = std::min(maxRounds,
-                                         static_cast<int>(std::ceil(maxCutoff / minCellSize)));
-                }
-            }
-            exchangeBackwardPairs(inputs.box_, maxRounds);
+            exchangeBackwardPairs(inputs.box_, mpiComm_.size() - 1);
         }
 
         // Step 3: Temporarily extend pairlistMta_ with backward pairs
