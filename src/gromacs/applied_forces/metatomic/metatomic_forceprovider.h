@@ -165,6 +165,20 @@ private:
      */
     int32_t exchangeBackwardGhosts(const gmx_domdec_t* dd, const matrix box, double cutoff);
 
+    /*! \brief Make every MTA atom available on every rank.
+     *
+     * A message-passing model needs, for each home atom, all atoms within
+     * the model interaction range and all pairs among them.  The DD halo
+     * only covers the forward direction and the plain pairlist lacks
+     * halo-halo pairs, so instead the home positions of all ranks are
+     * all-reduced and every MTA atom that is not already local is appended
+     * (as with backward ghosts, the caller restores numLocalMta_ after the
+     * model evaluation).
+     *
+     * \returns Number of atoms added.
+     */
+    int32_t gatherAllMtaAtoms();
+
     //! Distribute non-home forces via sparse indexed exchange (allgatherv pattern).
     //! Home forces are applied directly; only halo forces are communicated.
     //! \param[in] forces   Flat force array [numLocalMta_ * 3], row-major (fx,fy,fz).
