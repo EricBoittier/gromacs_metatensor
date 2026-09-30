@@ -1741,14 +1741,18 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             }
             auto posGrad    = block.gradient("positions");
             auto strainGrad = block.gradient("strain");
+            // metatomic converts the energy to kJ/mol, but the positions gradient stays per
+            // model length unit: kJ/mol/Angstrom for a model in Angstrom, 10x smaller than
+            // kJ/mol/nm. The strain gradient is per (dimensionless) strain.
+            const double forceScale = -1.0 / data_->lengthToNm;
             if (modelIsDouble)
             {
-                add_atom_rows<double>(posGrad, 2, nModel, -1.0, &forces);
+                add_atom_rows<double>(posGrad, 2, nModel, forceScale, &forces);
                 add_strain<double>(strainGrad, virialMatrix);
             }
             else
             {
-                add_atom_rows<float>(posGrad, 2, nModel, -1.0, &forces);
+                add_atom_rows<float>(posGrad, 2, nModel, forceScale, &forces);
                 add_strain<float>(strainGrad, virialMatrix);
             }
         }
