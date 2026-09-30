@@ -101,6 +101,7 @@ struct EmbeddedCoulombCorrection
  * \param[in] numEnergyGroups  Number of energy groups.
  * \param[in] sites   Site of each atom, empty for a single site; only pairs within a site
  *                    are corrected, as the MM interaction between sites is kept.
+ * \param[in] numThreads  OpenMP threads for the pair loop.
  */
 EmbeddedCoulombCorrection computeEmbeddedCoulombCorrection(ArrayRef<const RVec>       x,
                                                            ArrayRef<const real>       q,
@@ -108,7 +109,8 @@ EmbeddedCoulombCorrection computeEmbeddedCoulombCorrection(ArrayRef<const RVec> 
                                                            const interaction_const_t& ic,
                                                            ArrayRef<const int> energyGroups    = {},
                                                            int                 numEnergyGroups = 1,
-                                                           ArrayRef<const int> sites           = {});
+                                                           ArrayRef<const int> sites           = {},
+                                                           int                 numThreads      = 1);
 
 /*! \brief Force provider applying computeEmbeddedCoulombCorrection() to the embedded atoms.
  *

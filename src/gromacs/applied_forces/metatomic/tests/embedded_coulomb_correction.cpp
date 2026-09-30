@@ -218,6 +218,38 @@ TEST(EmbeddedCoulombCorrection, SplitsEnergyOverEnergyGroups)
     EXPECT_EQ(result.groupPairEnergies[GID(0, 0, 2)], 0);
 }
 
+TEST(EmbeddedCoulombCorrection, SameResultOnSeveralThreadsAndOnlyWithinSites)
+{
+    // 60 charged atoms spread over the box, in two sites
+    std::vector<RVec> x;
+    std::vector<real> q;
+    std::vector<int>  sites;
+    for (int i = 0; i < 60; i++)
+    {
+        x.push_back({ real(0.1 + 0.037 * i), real(0.2 + std::fmod(0.61 * i, c_box - 0.4)), real(0.3 + std::fmod(0.29 * i, c_box - 0.6)) });
+        q.push_back(real(0.1 * ((i % 5) - 2)));
+        sites.push_back(i % 2);
+    }
+    for (const auto& ic : { pmeConstants(), reactionFieldConstants() })
+    {
+        const auto serial   = computeEmbeddedCoulombCorrection(x, q, cubicPbc(), ic, {}, 1, sites, 1);
+        const auto threaded = computeEmbeddedCoulombCorrection(x, q, cubicPbc(), ic, {}, 1, sites, 4);
+        EXPECT_GT(serial.numPairs, 0);
+        EXPECT_EQ(serial.numPairs, threaded.numPairs);
+        EXPECT_NEAR(serial.energy, threaded.energy, 1e-9 * std::abs(serial.energy) + 1e-12);
+        for (size_t i = 0; i < x.size(); i++)
+        {
+            for (int d = 0; d < DIM; d++)
+            {
+                EXPECT_NEAR(serial.forces[i][d], threaded.forces[i][d], 1e-4);
+            }
+        }
+        // Pairs between the two sites are left alone: an all-pairs run has more of them
+        const auto allPairs = computeEmbeddedCoulombCorrection(x, q, cubicPbc(), ic, {}, 1, {}, 4);
+        EXPECT_GT(allPairs.numPairs, serial.numPairs);
+    }
+}
+
 } // namespace
 } // namespace test
 } // namespace gmx
