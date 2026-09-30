@@ -233,9 +233,35 @@ public:
                     max_cutoff = interaction_range;
                 }
 
+                // The model only reads pairs within its pair-list cutoffs; the longer
+                // interaction range comes from message passing over them. So the plain
+                // pairlist needs the largest cutoff plus a buffer for the motion between
+                // pairlist updates, not the interaction range (which forced rlist up to it).
+                double pairCutoff = 0.0;
                 for (const auto& pairs : model.requested_pair_lists())
                 {
-                    max_cutoff = std::max(max_cutoff, pairs.cutoff() * toNm);
+                    pairCutoff = std::max(pairCutoff, pairs.cutoff() * toNm);
+                }
+                if (pairCutoff > 0.0)
+                {
+                    // Twice the RMS displacement over a pairlist lifetime, as recommended
+                    // for PlainPairlistRanges, and at least 0.1 nm for fast ML hydrogens.
+                    // The normal pairlist holds no pairs beyond rlist, so the buffer ends
+                    // there; the cutoff itself must fit (mdrun stops otherwise).
+                    const double rmsd = ranges->rmsdDistance().value_or(0.0);
+                    max_cutoff        = std::max(
+                            pairCutoff,
+                            std::min(pairCutoff + std::max(2 * rmsd, 0.1),
+                                     static_cast<double>(ranges->pairlistCutoff())));
+                    GMX_LOG(options_.logger().info)
+                            .asParagraph()
+                            .appendTextFormatted(
+                                    "Metatomic: plain pairlist range %.3f nm (pair-list cutoff "
+                                    "%.3f nm + %.3f nm buffer; interaction range %.3f nm)",
+                                    max_cutoff,
+                                    pairCutoff,
+                                    max_cutoff - pairCutoff,
+                                    interaction_range);
                 }
             }
             catch (const std::exception& e)

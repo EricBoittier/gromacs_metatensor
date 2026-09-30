@@ -138,6 +138,16 @@ TEST(PlainPairlistRanges, NoAtomsWithAnUnrestrictedRange)
     EXPECT_FALSE(ppr.atoms().has_value());
 }
 
+TEST(PlainPairlistRanges, PairlistCutoffIsRlist)
+{
+    const auto mtop = testSystem();
+    t_inputrec ir;
+    ir.rlist = 0.576;
+
+    PlainPairlistRanges ppr(*mtop, ir);
+    EXPECT_EQ(ppr.pairlistCutoff(), ir.rlist);
+}
+
 TEST(PlainPairlistRanges, ThrowsWithAnEmptyAtomSet)
 {
     const auto mtop = testSystem();

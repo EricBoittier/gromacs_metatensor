@@ -99,6 +99,9 @@ public:
     //! Returns the list of requested ranges
     ArrayRef<const real> ranges() const { return ranges_; }
 
+    //! Returns the range of the normal pairlist, the upper limit for any requested range
+    real pairlistCutoff() const;
+
     /*! Returns the global atom indices the plain pairlist can be restricted to
      *
      * Returns the sorted union of the requested atom sets when every range request
