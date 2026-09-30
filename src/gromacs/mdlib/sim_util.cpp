@@ -1521,10 +1521,27 @@ static void doPairSearch(const t_commrec*             cr,
 
     if (alsoMakePlainPairlist)
     {
-        const auto& plainPairlist = nbv->plainPairlist(fr->plainPairlistRange.value(), fr->shift_vec);
+        wallcycle_start_nocount(wcycle, WallCycleCounter::NS);
+
+        // The filter is by global index; with domain decomposition we need it by local index
+        ArrayRef<const char> atomFilter = fr->plainPairlistGlobalAtomFilter;
+        if (!atomFilter.empty() && haveDDAtomOrdering(*cr))
+        {
+            const auto& globalAtomIndices = cr->dd->globalAtomIndices;
+            fr->plainPairlistLocalAtomFilter.resize(globalAtomIndices.size());
+            for (Index i = 0; i < gmx::ssize(globalAtomIndices); i++)
+            {
+                fr->plainPairlistLocalAtomFilter[i] = atomFilter[globalAtomIndices[i]];
+            }
+            atomFilter = fr->plainPairlistLocalAtomFilter;
+        }
+        const auto& plainPairlist =
+                nbv->plainPairlist(fr->plainPairlistRange.value(), fr->shift_vec, atomFilter);
         MDModulesPairlistConstructedSignal mdModulesPairlistConstructedSignal(
                 plainPairlist.pairs, plainPairlist.excludedPairs, mdatoms.typeA);
         mdModulesNotifiers.simulationRunNotifier_.notify(mdModulesPairlistConstructedSignal);
+
+        wallcycle_stop(wcycle, WallCycleCounter::NS);
     }
 }
 

@@ -252,7 +252,8 @@ public:
                     GMX_THROW(InconsistentInputError("Metatomic model cutoff is 0.0 or invalid."));
                 }
             }
-            ranges->addRange(max_cutoff);
+            // The model only uses pairs between its own atoms
+            ranges->addRange(max_cutoff, options_.parameters().mtaIndices_);
         };
         notifiers->simulationSetupNotifier_.subscribe(setPlainPairlistRangeFunction);
 #endif // GMX_METATOMIC_ACTIVE
