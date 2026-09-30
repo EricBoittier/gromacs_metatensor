@@ -61,6 +61,7 @@
 #include <cstdio>
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -373,6 +374,24 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
     }
 
     data_->model.to(data_->device);
+
+    // PyTorch wheels load their CUDA linear-algebra kernels lazily, through a stub that
+    // is not thread-safe: when two thread-MPI ranks make their first CUDA linalg call at
+    // the same time (PET-MAD's uncertainty head solves a triangular system), the second
+    // fails with "lazy wrapper should be called at most once". Trigger the load once per
+    // process before any model evaluation.
+    if (data_->device.is_cuda())
+    {
+        static std::once_flag s_cudaLinalgLoaded;
+        std::call_once(s_cudaLinalgLoaded,
+                       [device = data_->device]()
+                       {
+                           torch::NoGradGuard noGrad;
+                           const auto a = torch::eye(
+                                   2, torch::TensorOptions().dtype(torch::kFloat64).device(device));
+                           (void)torch::linalg_solve_triangular(a, a, /*upper=*/false);
+                       });
+    }
 
     if (data_->capabilities->dtype() == "float64")
     {
