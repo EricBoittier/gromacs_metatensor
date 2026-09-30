@@ -1,0 +1,11 @@
+; MM-only steepest descent
+integrator              = steep
+emtol                   = 500
+nsteps                  = 5000
+cutoff-scheme           = Verlet
+pbc                     = xyz
+coulombtype             = PME
+rcoulomb                = 1.0
+vdwtype                 = Cut-off
+rvdw                    = 1.0
+DispCorr                = EnerPres
