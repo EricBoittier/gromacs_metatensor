@@ -143,6 +143,8 @@ struct MetatomicParameters
     int numSites() const { return static_cast<int>(siteChargeValues_.size()); }
 };
 
+struct ExclusionDistanceExemptions;
+
 class MetatomicOptions final : public IMdpOptionProvider
 {
 public:
@@ -154,6 +156,8 @@ public:
     bool isActive() const;
     void setInputGroupIndices(const IndexGroupsAndNames&);
     void modifyTopology(gmx_mtop_t*);
+    //! With ONIOM, lists each site: the embedded Coulomb correction handles its exclusions at any distance
+    void addExclusionDistanceExemptions(ExclusionDistanceExemptions* exemptions) const;
     void writeParamsToKvt(KeyValueTreeObjectBuilder);
     void readParamsFromKvt(const KeyValueTreeObject&);
     void setLogger(const MDLogger&);

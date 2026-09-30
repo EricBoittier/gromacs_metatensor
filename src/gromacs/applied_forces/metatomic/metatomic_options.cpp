@@ -54,6 +54,7 @@
 
 #include "gromacs/domdec/localatomset.h"
 #include "gromacs/fileio/warninp.h"
+#include "gromacs/mdrunutility/mdmodulesnotifiers.h"
 #include "gromacs/mdtypes/imdpoptionprovider_helpers.h"
 #include "gromacs/options/basicoptions.h"
 #include "gromacs/options/optionsection.h"
@@ -641,6 +642,23 @@ void MetatomicOptions::modifyTopology(gmx_mtop_t* top)
     // Note: buildLinkFrontier is not called inside preprocessTopology because
     // we already built it above (and with the expanded set, there are no
     // cut bonds -- all boundary atoms are now embedded).
+}
+
+void MetatomicOptions::addExclusionDistanceExemptions(ExclusionDistanceExemptions* exemptions) const
+{
+    if (!params_.active || !params_.oniom)
+    {
+        return;
+    }
+    std::vector<std::vector<int>> sites(std::max(params_.numSites(), 1));
+    for (size_t k = 0; k < params_.mtaIndices_.size(); k++)
+    {
+        sites[params_.mtaSites_[k]].push_back(static_cast<int>(params_.mtaIndices_[k]));
+    }
+    for (auto& site : sites)
+    {
+        exemptions->groups.push_back(std::move(site));
+    }
 }
 
 void MetatomicOptions::writeParamsToKvt(KeyValueTreeObjectBuilder treeBuilder)

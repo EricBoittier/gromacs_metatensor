@@ -117,6 +117,11 @@ public:
         const auto modifyTopologyFunction = [this](gmx_mtop_t* top) { options_.modifyTopology(top); };
         notifiers->preProcessingNotifier_.subscribe(modifyTopologyFunction);
 
+        // Exclusions between embedded atoms are corrected at any distance with ONIOM
+        const auto exemptExclusionsFunction = [this](ExclusionDistanceExemptions* exemptions)
+        { options_.addExclusionDistanceExemptions(exemptions); };
+        notifiers->preProcessingNotifier_.subscribe(exemptExclusionsFunction);
+
         const auto writeParamsToKvtFunction = [this](KeyValueTreeObjectBuilder kvt)
         { options_.writeParamsToKvt(kvt); };
         notifiers->preProcessingNotifier_.subscribe(writeParamsToKvtFunction);
