@@ -229,14 +229,34 @@ public:
                     max_cutoff = interaction_range;
                 }
 
-                // Check requested neighbor lists
-                auto requested_nl = model.run_method("requested_neighbor_lists");
+                // The model only reads pairs within its neighbor-list cutoffs; the longer
+                // interaction range comes from message passing over them. So the plain
+                // pairlist needs the largest cutoff plus a buffer for the motion between
+                // pairlist updates, not the interaction range (which forced rlist up to it).
+                double nlCutoff     = 0.0;
+                auto   requested_nl = model.run_method("requested_neighbor_lists");
                 for (const auto& ivalue : requested_nl.toList())
                 {
                     auto options =
                             ivalue.get().toCustomClass<metatomic_torch::NeighborListOptionsHolder>();
-                    double cutoff = options->engine_cutoff("nm");
-                    max_cutoff    = std::max(max_cutoff, cutoff);
+                    nlCutoff = std::max(nlCutoff, options->engine_cutoff("nm"));
+                }
+                if (nlCutoff > 0.0)
+                {
+                    // Twice the RMS displacement over a pairlist lifetime, as recommended
+                    // for PlainPairlistRanges, and at least 0.1 nm for fast ML hydrogens
+                    const double rmsd   = ranges->rmsdDistance().value_or(0.0);
+                    const double buffer = std::max(2 * rmsd, 0.1);
+                    max_cutoff          = nlCutoff + buffer;
+                    GMX_LOG(options_.logger().info)
+                            .asParagraph()
+                            .appendTextFormatted(
+                                    "Metatomic: plain pairlist range %.3f nm (neighbor-list "
+                                    "cutoff %.3f nm + %.3f nm buffer; interaction range %.3f nm)",
+                                    max_cutoff,
+                                    nlCutoff,
+                                    buffer,
+                                    interaction_range);
                 }
             }
             catch (const std::exception& e)
