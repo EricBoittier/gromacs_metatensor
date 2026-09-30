@@ -244,10 +244,15 @@ public:
                 if (nlCutoff > 0.0)
                 {
                     // Twice the RMS displacement over a pairlist lifetime, as recommended
-                    // for PlainPairlistRanges, and at least 0.1 nm for fast ML hydrogens
-                    const double rmsd   = ranges->rmsdDistance().value_or(0.0);
-                    const double buffer = std::max(2 * rmsd, 0.1);
-                    max_cutoff          = nlCutoff + buffer;
+                    // for PlainPairlistRanges, and at least 0.1 nm for fast ML hydrogens.
+                    // The normal pairlist holds no pairs beyond rlist, so the buffer ends
+                    // there; the cutoff itself must fit (mdrun stops otherwise).
+                    const double rmsd = ranges->rmsdDistance().value_or(0.0);
+                    max_cutoff        = std::max(
+                            nlCutoff,
+                            std::min(nlCutoff + std::max(2 * rmsd, 0.1),
+                                     static_cast<double>(ranges->pairlistCutoff())));
+                    const double buffer = max_cutoff - nlCutoff;
                     GMX_LOG(options_.logger().info)
                             .asParagraph()
                             .appendTextFormatted(

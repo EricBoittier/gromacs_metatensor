@@ -111,6 +111,11 @@ std::optional<real> PlainPairlistRanges::rmsdDistance() const
     return std::nullopt;
 }
 
+real PlainPairlistRanges::pairlistCutoff() const
+{
+    return inputrec_.rlist;
+}
+
 void PlainPairlistRanges::addRange(const real range)
 {
     if (range <= 0)
