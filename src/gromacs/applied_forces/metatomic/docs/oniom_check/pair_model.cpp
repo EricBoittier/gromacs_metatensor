@@ -261,7 +261,7 @@ mta_status_t load(const char* path, const char* /*options*/, mta_model_t* model)
     std::ifstream input(file);
     if (file.size() < 5 || file.substr(file.size() - 5) != ".pair" || !input)
     {
-        return MTA_MODEL_NOT_SUPPORTED_ERROR;
+        return MTA_UNSUPPORTED_MODEL_ERROR;
     }
     double rc = 0, a = 0, lambda = 0;
     int    perAtom = 0;
