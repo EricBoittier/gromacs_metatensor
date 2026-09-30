@@ -42,13 +42,18 @@
 
 #include <cmath>
 
+#include <algorithm>
+#include <vector>
+
 #include "gromacs/math/units.h"
+#include "gromacs/mdlib/gmx_omp_nthreads.h"
 #include "gromacs/mdtypes/enerdata.h"
 #include "gromacs/mdtypes/forceoutput.h"
 #include "gromacs/mdtypes/group.h"
 #include "gromacs/mdtypes/interaction_const.h"
 #include "gromacs/mdtypes/md_enums.h"
 #include "gromacs/pbcutil/pbc.h"
+#include "gromacs/utility/gmxomp.h"
 #include "gromacs/utility/exceptions.h"
 #include "gromacs/utility/mpicomm.h"
 #include "gromacs/utility/stringutil.h"
@@ -61,7 +66,9 @@ EmbeddedCoulombCorrection computeEmbeddedCoulombCorrection(ArrayRef<const RVec> 
                                                            const t_pbc&               pbc,
                                                            const interaction_const_t& ic,
                                                            ArrayRef<const int>        energyGroups,
-                                                           int numEnergyGroups)
+                                                           int                 numEnergyGroups,
+                                                           ArrayRef<const int> sites,
+                                                           int                 numThreads)
 {
     const auto& coulomb = ic.coulomb;
     const bool  ewald   = usingPmeOrEwald(coulomb.type);
@@ -77,6 +84,7 @@ EmbeddedCoulombCorrection computeEmbeddedCoulombCorrection(ArrayRef<const RVec> 
     GMX_RELEASE_ASSERT(q.ssize() == n, "Need one charge per embedded atom");
     GMX_RELEASE_ASSERT(energyGroups.empty() || energyGroups.ssize() == n,
                        "Need one energy group per embedded atom");
+    GMX_RELEASE_ASSERT(sites.empty() || sites.ssize() == n, "Need one site per embedded atom");
 
     EmbeddedCoulombCorrection result;
     result.forces.assign(n, { 0, 0, 0 });
@@ -89,53 +97,96 @@ EmbeddedCoulombCorrection computeEmbeddedCoulombCorrection(ArrayRef<const RVec> 
     const double twoBetaOverSqrtPi = 2 * beta / std::sqrt(M_PI);
     const auto   group = [&](int i) { return energyGroups.empty() ? 0 : energyGroups[i]; };
 
-    for (int i = 0; i < n; i++)
+    // For an ML region of thousands of atoms this is millions of pairs per step: the pairs
+    // are split over the OpenMP threads, each with its own forces, virial and energies
+    const int                              numThreadsUsed = std::max(1, std::min(numThreads, n));
+    std::vector<EmbeddedCoulombCorrection> perThread(numThreadsUsed);
+#pragma omp parallel num_threads(numThreadsUsed)
     {
-        for (int j = i + 1; j < n; j++)
+      try
+      {
+        auto& local = perThread[gmx_omp_get_thread_num()];
+        local.forces.assign(n, { 0, 0, 0 });
+        local.groupPairEnergies.assign(numEnergyGroups * numEnergyGroups, 0.0);
+        // Rows get shorter with i; interleave them over the threads
+#pragma omp for schedule(dynamic, 16)
+        for (int i = 0; i < n; i++)
         {
-            const double qq = coulomb.epsfac * q[i] * q[j];
-            if (qq == 0)
+            for (int j = i + 1; j < n; j++)
             {
-                continue;
+                if (!sites.empty() && sites[i] != sites[j])
+                {
+                    continue;
+                }
+                const double qq = coulomb.epsfac * q[i] * q[j];
+                if (qq == 0)
+                {
+                    continue;
+                }
+                RVec dxr;
+                pbc_dx_aiuc(&pbc, x[i], x[j], dxr);
+                const DVec   dx(dxr[XX], dxr[YY], dxr[ZZ]);
+                const double r2 = dx.norm2();
+                // Ewald: the kernels remove the reciprocal-space pair within the
+                // cut-off, we remove it beyond. Reaction-field: the kernels add
+                // k_rf r^2 - c_rf within the cut-off, we take it out again.
+                if (ewald == (r2 < rc2))
+                {
+                    continue;
+                }
+                // v is the pair energy, fscal = -(dv/dr) / r
+                double v, fscal;
+                if (ewald)
+                {
+                    const double r   = std::sqrt(r2);
+                    const double erf = std::erf(beta * r);
+                    v                = -qq * erf / r;
+                    fscal = -qq * (erf / r - twoBetaOverSqrtPi * std::exp(-beta * beta * r2)) / r2;
+                }
+                else
+                {
+                    v     = -qq * (krf * r2 - crf);
+                    fscal = 2 * qq * krf;
+                }
+                const DVec f = fscal * dx;
+                local.energy += v;
+                local.groupPairEnergies[GID(group(i), group(j), numEnergyGroups)] += v;
+                for (int d = 0; d < DIM; d++)
+                {
+                    local.forces[i][d] += f[d];
+                    local.forces[j][d] -= f[d];
+                    for (int e = 0; e < DIM; e++)
+                    {
+                        local.virial[d][e] -= 0.5 * dx[d] * f[e];
+                    }
+                }
+                local.numPairs++;
             }
-            RVec dxr;
-            pbc_dx_aiuc(&pbc, x[i], x[j], dxr);
-            const DVec   dx(dxr[XX], dxr[YY], dxr[ZZ]);
-            const double r2 = dx.norm2();
-            // Ewald: the kernels remove the reciprocal-space pair within the
-            // cut-off, we remove it beyond. Reaction-field: the kernels add
-            // k_rf r^2 - c_rf within the cut-off, we take it out again.
-            if (ewald == (r2 < rc2))
-            {
-                continue;
-            }
-            // v is the pair energy, fscal = -(dv/dr) / r
-            double v, fscal;
-            if (ewald)
-            {
-                const double r   = std::sqrt(r2);
-                const double erf = std::erf(beta * r);
-                v                = -qq * erf / r;
-                fscal = -qq * (erf / r - twoBetaOverSqrtPi * std::exp(-beta * beta * r2)) / r2;
-            }
-            else
-            {
-                v     = -qq * (krf * r2 - crf);
-                fscal = 2 * qq * krf;
-            }
-            const DVec f = fscal * dx;
-            result.energy += v;
-            result.groupPairEnergies[GID(group(i), group(j), numEnergyGroups)] += v;
+        }
+      }
+      GMX_CATCH_ALL_AND_EXIT_WITH_FATAL_ERROR
+    }
+    for (const auto& local : perThread)
+    {
+        result.energy += local.energy;
+        result.numPairs += local.numPairs;
+        for (size_t g = 0; g < local.groupPairEnergies.size(); g++)
+        {
+            result.groupPairEnergies[g] += local.groupPairEnergies[g];
+        }
+        for (int i = 0; i < n; i++)
+        {
             for (int d = 0; d < DIM; d++)
             {
-                result.forces[i][d] += f[d];
-                result.forces[j][d] -= f[d];
-                for (int e = 0; e < DIM; e++)
-                {
-                    result.virial[d][e] -= 0.5 * dx[d] * f[e];
-                }
+                result.forces[i][d] += local.forces[i][d];
             }
-            result.numPairs++;
+        }
+        for (int d = 0; d < DIM; d++)
+        {
+            for (int e = 0; e < DIM; e++)
+            {
+                result.virial[d][e] += local.virial[d][e];
+            }
         }
     }
     return result;
@@ -146,11 +197,13 @@ EmbeddedCoulombCorrectionProvider::EmbeddedCoulombCorrectionProvider(const Local
                                                                      std::vector<int> energyGroups,
                                                                      int            numEnergyGroups,
                                                                      PbcType        pbcType,
-                                                                     const MpiComm& mpiComm) :
+                                                                     const MpiComm& mpiComm,
+                                                                     std::vector<int> sites) :
     atoms_(atoms),
     charges_(std::move(charges)),
     energyGroups_(std::move(energyGroups)),
     numEnergyGroups_(numEnergyGroups),
+    sites_(std::move(sites)),
     pbcType_(pbcType),
     mpiComm_(mpiComm),
     positions_(3 * charges_.size())
@@ -186,7 +239,8 @@ void EmbeddedCoulombCorrectionProvider::calculateForces(const ForceProviderInput
     t_pbc pbc;
     set_pbc(&pbc, pbcType_, input.box_);
     const auto correction = computeEmbeddedCoulombCorrection(
-            x, charges_, pbc, *input.interactionConst_, energyGroups_, numEnergyGroups_);
+            x, charges_, pbc, *input.interactionConst_, energyGroups_, numEnergyGroups_, sites_,
+            gmx_omp_nthreads_get(ModuleMultiThread::Default));
 
     auto force = output->forceWithVirial_.force_;
     for (size_t k = 0; k < atoms_.numAtomsLocal(); k++)
