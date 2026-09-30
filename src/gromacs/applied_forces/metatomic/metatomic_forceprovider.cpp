@@ -286,13 +286,15 @@ static double sum_block(metatensor::TensorBlock& block)
     return sum;
 }
 
-//! Add `scale * values` into `forces`, indexing atoms by a sample column.
+//! Add `scale * values` into `forces`, indexing atoms by a sample column. With several systems
+//! (ML sites), `systemRows[system][atom]` gives the model row of an atom of a system.
 template<typename T>
-static void add_atom_rows(metatensor::TensorBlock& block,
-                          int                      atomColumn,
-                          int32_t                  nAtoms,
-                          double                   scale,
-                          std::vector<double>*     forces)
+static void add_atom_rows(metatensor::TensorBlock&                 block,
+                          int                                      atomColumn,
+                          int32_t                                  nAtoms,
+                          double                                   scale,
+                          std::vector<double>*                     forces,
+                          const std::vector<std::vector<int32_t>>* systemRows = nullptr)
 {
     auto       sampleLabels = block.samples();
     const auto samples      = sampleLabels.values_cpu();
@@ -300,7 +302,11 @@ static void add_atom_rows(metatensor::TensorBlock& block,
     const auto shape        = values.shape();
     for (size_t row = 0; row < sampleLabels.count(); ++row)
     {
-        const int32_t atom = samples(row, static_cast<size_t>(atomColumn));
+        int32_t atom = samples(row, static_cast<size_t>(atomColumn));
+        if (systemRows != nullptr)
+        {
+            atom = (*systemRows)[samples(row, static_cast<size_t>(atomColumn - 1))][atom];
+        }
         if (atom < 0 || atom >= nAtoms)
         {
             GMX_THROW(APIError("Metatomic output names an atom outside the local set"));
@@ -392,6 +398,8 @@ struct MetatomicData
 
     //! Requested per-atom charge inputs, filled from the topology charges.
     std::vector<metatomic::Quantity> chargeInputs;
+    //! Requested per-system inputs (charge, spin_multiplicity), filled from the site options.
+    std::vector<metatomic::Quantity> systemInputs;
 
     //! Home-atom selection. Rebuilt when numHomeMta_ changes.
     std::optional<metatensor::Labels> selectedAtoms;
@@ -616,18 +624,23 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
 
     for (const auto& input : data_->model->requested_inputs())
     {
-        if (!isChargeInput(input.name()))
+        const bool perSystem = input.sample_kind() == metatomic::SampleKind::System;
+        if (perSystem && (isChargeInput(input.name()) || input.name() == "spin_multiplicity"))
+        {
+            // the total charge and spin multiplicity of each ML site (metatomic-site-charges,
+            // metatomic-site-spin-multiplicities), one system per site
+            data_->systemInputs.push_back(input);
+            continue;
+        }
+        if (!isChargeInput(input.name()) || input.sample_kind() != metatomic::SampleKind::Atom)
         {
             GMX_THROW(APIError(formatString(
-                    "The model requests the input '%s', which GROMACS can not provide "
-                    "(only 'charge' is supported).",
-                    input.name().c_str())));
-        }
-        if (input.sample_kind() != metatomic::SampleKind::Atom)
-        {
-            GMX_THROW(APIError(formatString("The model requests '%s' per system; GROMACS only "
-                                            "provides per-atom charges.",
-                                            input.name().c_str())));
+                    "The model requests the input '%s' (per %s), which GROMACS can not provide. "
+                    "Supported inputs are the per-atom 'charge' (from the topology) and the "
+                    "per-system 'charge' and 'spin_multiplicity' (metatomic-site-charges, "
+                    "metatomic-site-spin-multiplicities).",
+                    input.name().c_str(),
+                    perSystem ? "system" : "atom")));
         }
         if (options_.params_.mmCharges_.empty())
         {
@@ -1480,12 +1493,84 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             }
         }
 
-        auto system = metatomic::System(
-                "nm",
-                wrap_dlpack(modelTypes.data(), { nModel }, { kDLInt, 32, 1 }),
-                wrap_dlpack(positionData, { nModel, 3 }, floatType),
-                wrap_dlpack(cellData, { 3, 3 }, floatType),
-                wrap_dlpack(data_->pbc.data(), { 3 }, { kDLBool, 8, 1 }));
+        // ML sites (metatomic-site-groups): each site is its own system. A row's site is its
+        // atom's, and a cap's that of the MM atom it replaces (which joined its ML partner's site).
+        const int  numSites  = options_.params_.numSites();
+        const bool multiSite = numSites > 1;
+        if (multiSite && (useNewtonNL || data_->nonConservative))
+        {
+            GMX_THROW(NotImplementedError(
+                    "metatomic-site-groups with several sites needs a single rank and a "
+                    "conservative model."));
+        }
+        std::vector<int>                  siteOfRow;
+        std::vector<int32_t>              localRow;
+        std::vector<std::vector<int32_t>> siteRows(multiSite ? numSites : 1);
+        if (multiSite)
+        {
+            siteOfRow.resize(nModel);
+            localRow.resize(nModel);
+            for (int32_t row = 0; row < nModel; ++row)
+            {
+                const int32_t source = row < nLocal ? row : chargeSource[row];
+                siteOfRow[row]       = options_.params_.mtaSites_[mtaToGlobalMta_[source]];
+                localRow[row]        = static_cast<int32_t>(siteRows[siteOfRow[row]].size());
+                siteRows[siteOfRow[row]].push_back(row);
+            }
+        }
+        // per-site copies of the types and positions, alive until the model has run
+        std::vector<std::vector<int32_t>> siteTypes(siteRows.size());
+        std::vector<std::vector<double>>  sitePositions64(siteRows.size());
+        std::vector<std::vector<float>>   sitePositions32(siteRows.size());
+        std::vector<metatomic::System>    systems;
+        if (!multiSite)
+        {
+            systems.push_back(metatomic::System(
+                    "nm",
+                    wrap_dlpack(modelTypes.data(), { nModel }, { kDLInt, 32, 1 }),
+                    wrap_dlpack(positionData, { nModel, 3 }, floatType),
+                    wrap_dlpack(cellData, { 3, 3 }, floatType),
+                    wrap_dlpack(data_->pbc.data(), { 3 }, { kDLBool, 8, 1 })));
+        }
+        else
+        {
+            for (int s = 0; s < numSites; ++s)
+            {
+                const auto&   rows = siteRows[s];
+                const int64_t n    = static_cast<int64_t>(rows.size());
+                void*         pos  = nullptr;
+                const auto    copy = [&](auto* all, auto& out)
+                {
+                    out.resize(3 * rows.size());
+                    for (size_t k = 0; k < rows.size(); ++k)
+                    {
+                        for (int d = 0; d < 3; ++d)
+                        {
+                            out[3 * k + d] = all[3 * rows[k] + d];
+                        }
+                    }
+                    pos = out.data();
+                };
+                if (modelIsDouble)
+                {
+                    copy(static_cast<const double*>(positionData), sitePositions64[s]);
+                }
+                else
+                {
+                    copy(static_cast<const float*>(positionData), sitePositions32[s]);
+                }
+                for (const int32_t row : rows)
+                {
+                    siteTypes[s].push_back(modelTypes[row]);
+                }
+                systems.push_back(metatomic::System(
+                        "nm",
+                        wrap_dlpack(siteTypes[s].data(), { n }, { kDLInt, 32, 1 }),
+                        wrap_dlpack(pos, { n, 3 }, floatType),
+                        wrap_dlpack(cellData, { 3, 3 }, floatType),
+                        wrap_dlpack(data_->pbc.data(), { 3 }, { kDLBool, 8, 1 })));
+            }
+        }
 
         // Topology charges; a cap carries the charge of the MM atom it replaces.
         for (const auto& input : data_->chargeInputs)
@@ -1509,33 +1594,83 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 }
                 charges[i] = toUnit * options_.params_.mmCharges_[globalAtom];
             }
-            std::vector<int32_t> sampleValues(static_cast<size_t>(nModel) * 2, 0);
-            for (int32_t i = 0; i < nModel; ++i)
+            for (size_t s = 0; s < systems.size(); ++s)
             {
-                sampleValues[2 * i + 1] = i;
+                std::vector<double> systemCharges;
+                if (!multiSite)
+                {
+                    systemCharges = charges;
+                }
+                else
+                {
+                    for (const int32_t row : siteRows[s])
+                    {
+                        systemCharges.push_back(charges[row]);
+                    }
+                }
+                const auto           n = static_cast<int32_t>(systemCharges.size());
+                std::vector<int32_t> sampleValues(static_cast<size_t>(n) * 2, 0);
+                for (int32_t i = 0; i < n; ++i)
+                {
+                    sampleValues[2 * i + 1] = i;
+                }
+                const int32_t zero  = 0;
+                const auto    shape = std::vector<uintptr_t>{ static_cast<uintptr_t>(n), 1 };
+                std::unique_ptr<metatensor::DataArrayBase> values;
+                if (modelIsDouble)
+                {
+                    values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::move(systemCharges));
+                }
+                else
+                {
+                    values = std::make_unique<metatensor::SimpleDataArray<float>>(
+                            shape, std::vector<float>(systemCharges.begin(), systemCharges.end()));
+                }
+                std::vector<metatensor::TensorBlock> blocks;
+                blocks.emplace_back(std::move(values),
+                                    metatensor::Labels({ "system", "atom" },
+                                                       n == 0 ? nullptr : sampleValues.data(),
+                                                       static_cast<size_t>(n)),
+                                    std::vector<metatensor::Labels>{},
+                                    metatensor::Labels({ "charge" }, &zero, 1));
+                systems[s].add_custom_data(input.name(),
+                                           metatensor::TensorMap(metatensor::Labels({ "_" }, &zero, 1),
+                                                                 std::move(blocks)));
             }
-            const int32_t zero  = 0;
-            const auto    shape = std::vector<uintptr_t>{ static_cast<uintptr_t>(nModel), 1 };
-            std::unique_ptr<metatensor::DataArrayBase> values;
-            if (modelIsDouble)
+        }
+
+        // Per-system total charge and spin multiplicity, from the site options
+        for (const auto& input : data_->systemInputs)
+        {
+            const bool   spin   = input.name() == "spin_multiplicity";
+            const double toUnit = spin || input.unit().empty()
+                                          ? 1.0
+                                          : metatomic::unit_conversion_factor("e", input.unit());
+            for (size_t s = 0; s < systems.size(); ++s)
             {
-                values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::move(charges));
+                const double value = spin ? options_.params_.siteSpinValues_[s]
+                                          : toUnit * options_.params_.siteChargeValues_[s];
+                const int32_t zero  = 0;
+                const auto    shape = std::vector<uintptr_t>{ 1, 1 };
+                std::unique_ptr<metatensor::DataArrayBase> values;
+                if (modelIsDouble)
+                {
+                    values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::vector<double>{ value });
+                }
+                else
+                {
+                    values = std::make_unique<metatensor::SimpleDataArray<float>>(
+                            shape, std::vector<float>{ static_cast<float>(value) });
+                }
+                std::vector<metatensor::TensorBlock> blocks;
+                blocks.emplace_back(std::move(values),
+                                    metatensor::Labels({ "system" }, &zero, 1),
+                                    std::vector<metatensor::Labels>{},
+                                    metatensor::Labels({ spin ? "spin_multiplicity" : "charge" }, &zero, 1));
+                systems[s].add_custom_data(input.name(),
+                                           metatensor::TensorMap(metatensor::Labels({ "_" }, &zero, 1),
+                                                                 std::move(blocks)));
             }
-            else
-            {
-                values = std::make_unique<metatensor::SimpleDataArray<float>>(
-                        shape, std::vector<float>(charges.begin(), charges.end()));
-            }
-            std::vector<metatensor::TensorBlock> blocks;
-            blocks.emplace_back(std::move(values),
-                                metatensor::Labels({ "system", "atom" },
-                                                   nModel == 0 ? nullptr : sampleValues.data(),
-                                                   static_cast<size_t>(nModel)),
-                                std::vector<metatensor::Labels>{},
-                                metatensor::Labels({ "charge" }, &zero, 1));
-            system.add_custom_data(input.name(),
-                                   metatensor::TensorMap(metatensor::Labels({ "_" }, &zero, 1),
-                                                         std::move(blocks)));
         }
         tensorPrepTimer.stop();
 
@@ -1610,31 +1745,66 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                     }
                 }
             }
-            const int64_t nPairs = static_cast<int64_t>(nlVectorsBuffer_.size() / 3);
-
-            auto samples = metatensor::Labels(
-                    data_->nlSampleNames,
-                    nPairs == 0 ? nullptr : nlSamplesBuffer_.data(),
-                    static_cast<size_t>(nPairs));
-            const int32_t                   xyzValues[3] = { 0, 1, 2 };
-            const int32_t                   distanceValue = 0;
-            std::vector<metatensor::Labels> components;
-            components.push_back(metatensor::Labels({ "xyz" }, xyzValues, 3));
-            auto properties = metatensor::Labels({ "distance" }, &distanceValue, 1);
-
-            std::unique_ptr<metatensor::DataArrayBase> values;
-            const auto shape = std::vector<uintptr_t>{ static_cast<uintptr_t>(nPairs), 3, 1 };
-            if (modelIsDouble)
+            const int32_t xyzValues[3]  = { 0, 1, 2 };
+            const int32_t distanceValue = 0;
+            const auto    addBlock      = [&](metatomic::System&          target,
+                                       const std::vector<int32_t>& sampleValues,
+                                       const std::vector<double>&  vectors)
             {
-                values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, nlVectorsBuffer_);
+                const int64_t nPairs  = static_cast<int64_t>(vectors.size() / 3);
+                auto          samples = metatensor::Labels(
+                        data_->nlSampleNames,
+                        nPairs == 0 ? nullptr : sampleValues.data(),
+                        static_cast<size_t>(nPairs));
+                std::vector<metatensor::Labels> components;
+                components.push_back(metatensor::Labels({ "xyz" }, xyzValues, 3));
+                auto properties = metatensor::Labels({ "distance" }, &distanceValue, 1);
+
+                std::unique_ptr<metatensor::DataArrayBase> values;
+                const auto shape = std::vector<uintptr_t>{ static_cast<uintptr_t>(nPairs), 3, 1 };
+                if (modelIsDouble)
+                {
+                    values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, vectors);
+                }
+                else
+                {
+                    values = std::make_unique<metatensor::SimpleDataArray<float>>(
+                            shape, std::vector<float>(vectors.begin(), vectors.end()));
+                }
+                target.add_pairs(request,
+                                 metatensor::TensorBlock(std::move(values), samples, components, properties));
+            };
+            if (!multiSite)
+            {
+                addBlock(systems[0], nlSamplesBuffer_, nlVectorsBuffer_);
             }
             else
             {
-                values = std::make_unique<metatensor::SimpleDataArray<float>>(
-                        shape, std::vector<float>(nlVectorsBuffer_.begin(), nlVectorsBuffer_.end()));
+                // pairs within a site only, in the site's row numbering
+                std::vector<std::vector<int32_t>> siteSamples(numSites);
+                std::vector<std::vector<double>>  siteVectors(numSites);
+                const size_t nPairs = nlVectorsBuffer_.size() / 3;
+                for (size_t k = 0; k < nPairs; ++k)
+                {
+                    const int32_t ai = nlSamplesBuffer_[5 * k];
+                    const int32_t aj = nlSamplesBuffer_[5 * k + 1];
+                    const int     s  = siteOfRow[ai];
+                    if (siteOfRow[aj] != s)
+                    {
+                        continue;
+                    }
+                    siteSamples[s].insert(siteSamples[s].end(),
+                                          { localRow[ai], localRow[aj], nlSamplesBuffer_[5 * k + 2],
+                                            nlSamplesBuffer_[5 * k + 3], nlSamplesBuffer_[5 * k + 4] });
+                    siteVectors[s].insert(siteVectors[s].end(),
+                                          nlVectorsBuffer_.begin() + 3 * k,
+                                          nlVectorsBuffer_.begin() + 3 * k + 3);
+                }
+                for (int s = 0; s < numSites; ++s)
+                {
+                    addBlock(systems[s], siteSamples[s], siteVectors[s]);
+                }
             }
-            system.add_pairs(request,
-                             metatensor::TensorBlock(std::move(values), samples, components, properties));
         }
         buildNLTimer.stop();
 
@@ -1692,8 +1862,6 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         }
 
         MetatomicTimer forwardTimer("execute_model", mpiComm_);
-        std::vector<metatomic::System> systems;
-        systems.push_back(std::move(system));
         std::vector<metatensor::TensorMap> modelOutputs;
         try
         {
@@ -1762,12 +1930,12 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             const double forceScale = -1.0 / data_->lengthToNm;
             if (modelIsDouble)
             {
-                add_atom_rows<double>(posGrad, 2, nModel, forceScale, &forces);
+                add_atom_rows<double>(posGrad, 2, nModel, forceScale, &forces, multiSite ? &siteRows : nullptr);
                 add_strain<double>(strainGrad, virialMatrix);
             }
             else
             {
-                add_atom_rows<float>(posGrad, 2, nModel, forceScale, &forces);
+                add_atom_rows<float>(posGrad, 2, nModel, forceScale, &forces, multiSite ? &siteRows : nullptr);
                 add_strain<float>(strainGrad, virialMatrix);
             }
         }
