@@ -81,6 +81,24 @@ if(NOT GMX_METATOMIC STREQUAL "OFF")
             endif()
         endforeach()
         list(REMOVE_DUPLICATES CMAKE_INSTALL_RPATH)
+
+        # Optional vesin (a directory with include/vesin.h and lib/libvesin.so, e.g. the vesin
+        # Python package) for the distributed evaluation's pair lists.
+        set(GMX_METATOMIC_VESIN OFF)
+        if(GMX_METATOMIC_VESIN_DIR)
+            find_path(VESIN_INCLUDE_DIR vesin.h HINTS "${GMX_METATOMIC_VESIN_DIR}/include" NO_DEFAULT_PATH)
+            find_library(VESIN_LIBRARY vesin HINTS "${GMX_METATOMIC_VESIN_DIR}/lib" NO_DEFAULT_PATH)
+            if(VESIN_INCLUDE_DIR AND VESIN_LIBRARY)
+                set(GMX_METATOMIC_VESIN ON)
+                include_directories(SYSTEM "${VESIN_INCLUDE_DIR}")
+                list(APPEND GMX_COMMON_LIBRARIES "${VESIN_LIBRARY}")
+                get_filename_component(_vesin_libdir "${VESIN_LIBRARY}" DIRECTORY)
+                list(APPEND CMAKE_INSTALL_RPATH "${_vesin_libdir}")
+                message(STATUS "Found vesin: ${VESIN_LIBRARY}")
+            else()
+                message(WARNING "GMX_METATOMIC_VESIN_DIR=${GMX_METATOMIC_VESIN_DIR} has no vesin.h and libvesin")
+            endif()
+        endif()
     elseif(GMX_METATOMIC STREQUAL "TORCH")
         message(FATAL_ERROR
             "metatomic was not found. Install libmetatomic and add the "

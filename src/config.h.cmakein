@@ -487,6 +487,10 @@
  * when libmetatomic was found. */
 #cmakedefine01 GMX_METATOMIC_ACTIVE
 
+/* Whether the metatomic force provider can build pair lists with vesin
+ * (GMX_METATOMIC_DIST_NL=vesin), from GMX_METATOMIC_VESIN_DIR */
+#cmakedefine01 GMX_METATOMIC_VESIN
+
 /* Build using clang analyzer */
 #cmakedefine01 GMX_CLANG_ANALYZER
 
