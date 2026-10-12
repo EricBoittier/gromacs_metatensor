@@ -614,35 +614,33 @@ void MetatomicOptions::modifyTopology(gmx_mtop_t* top)
         }
     }
 
+    // Topology surgery on the ML atoms alone, as NNPot does: a bond cut by the ML/MM boundary
+    // has one MM atom, so it stays in MM with every angle and dihedral through it. Only then
+    // are the boundary MM atoms added to the model's atoms, as the rows their link caps take.
+    std::set<int> boundaryMM;
     if (params_.linkAtoms)
     {
-        // NNPot-style: identify boundary MM atoms first (by scanning bonds
-        // between ML and non-ML atoms), add them to the embedded set, THEN
-        // run topology surgery on the expanded set.  This ensures:
-        // - NB exclusions include boundary MM atoms (no double-counting)
-        // - Bonded terms between ML and boundary-MM are properly handled
-        // - buildLinkFrontier finds zero cut bonds (all boundary atoms are embedded)
-        //
-        // The link frontier is built from the ORIGINAL ML set (before expansion)
-        // so we know which embedded atoms are "real ML" vs "boundary MM".
-        std::set<int> origMtaSet(params_.mtaIndices_.begin(), params_.mtaIndices_.end());
-
-        std::set<int> boundaryMM;
-        for (const auto& [embedded, mm] : findCutBonds(*top, origMtaSet))
+        const std::set<int> mlSet(params_.mtaIndices_.begin(), params_.mtaIndices_.end());
+        for (const auto& [embedded, mm] : findCutBonds(*top, mlSet))
         {
             addLinkFrontierAtom(&boundaryMM, &params_.linkFrontier_, embedded, mm);
         }
+    }
+    preprocessTopology(top, params_.mtaIndices_, params_.mtaSites_, params_.numSites(), logger(), wi_,
+                       /*buildLinks=*/false, nullptr);
 
-        // Add boundary MM atoms to the embedded set, in the site of their embedded partner
-        std::map<Index, int> siteOfOriginal;
+    if (params_.linkAtoms)
+    {
+        // Each boundary MM atom joins the site of its ML partner
+        std::map<Index, int> siteOfML;
         for (size_t k = 0; k < params_.mtaIndices_.size(); k++)
         {
-            siteOfOriginal[params_.mtaIndices_[k]] = params_.mtaSites_[k];
+            siteOfML[params_.mtaIndices_[k]] = params_.mtaSites_[k];
         }
         std::map<int, int> siteOfBoundary;
         for (const auto& link : params_.linkFrontier_)
         {
-            const int s                       = siteOfOriginal.at(link.getEmbeddedIndex());
+            const int s               = siteOfML.at(link.getEmbeddedIndex());
             const auto [it, inserted] = siteOfBoundary.emplace(link.getMMIndex(), s);
             if (!inserted && it->second != s)
             {
@@ -659,19 +657,11 @@ void MetatomicOptions::modifyTopology(gmx_mtop_t* top)
         }
 
         GMX_LOG(logger().info)
-                .appendTextFormatted("Metatomic: expanded embedded set from %zu to %zu atoms "
-                                     "(%zu boundary MM for link atoms)",
-                                     origMtaSet.size(),
-                                     params_.mtaIndices_.size(),
+                .appendTextFormatted("Metatomic: %zu link caps; the %zu boundary MM atoms keep their "
+                                     "MM interactions and are passed to the model as cap rows",
+                                     params_.linkFrontier_.size(),
                                      boundaryMM.size());
     }
-
-    // Run topology surgery on the (possibly expanded) embedded set
-    preprocessTopology(top, params_.mtaIndices_, params_.mtaSites_, params_.numSites(), logger(), wi_,
-                       /*buildLinks=*/false, nullptr);
-    // Note: buildLinkFrontier is not called inside preprocessTopology because
-    // we already built it above (and with the expanded set, there are no
-    // cut bonds -- all boundary atoms are now embedded).
 }
 
 void MetatomicOptions::addExclusionDistanceExemptions(ExclusionDistanceExemptions* exemptions) const
@@ -680,10 +670,19 @@ void MetatomicOptions::addExclusionDistanceExemptions(ExclusionDistanceExemption
     {
         return;
     }
+    // The boundary MM atoms of link caps keep their exclusions and interactions: ML atoms only
+    std::set<Index> boundaryMM;
+    for (const auto& link : params_.linkFrontier_)
+    {
+        boundaryMM.insert(link.getMMIndex());
+    }
     std::vector<std::vector<int>> sites(std::max(params_.numSites(), 1));
     for (size_t k = 0; k < params_.mtaIndices_.size(); k++)
     {
-        sites[params_.mtaSites_[k]].push_back(static_cast<int>(params_.mtaIndices_[k]));
+        if (boundaryMM.count(params_.mtaIndices_[k]) == 0)
+        {
+            sites[params_.mtaSites_[k]].push_back(static_cast<int>(params_.mtaIndices_[k]));
+        }
     }
     for (auto& site : sites)
     {

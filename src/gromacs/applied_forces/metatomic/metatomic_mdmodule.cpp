@@ -66,6 +66,8 @@
 
 #include <cmath>
 
+#include <set>
+
 #if GMX_METATOMIC_ACTIVE
 #    include <metatomic.hpp>
 #endif
@@ -335,6 +337,13 @@ public:
         const auto& params = options_.parameters();
         if (params.oniom)
         {
+            // The boundary MM atoms of link caps are not embedded: their Coulomb interactions
+            // stay with the kernels, so they take no part in the correction (zero charge)
+            std::set<Index> boundaryMM;
+            for (const auto& link : params.linkFrontier_)
+            {
+                boundaryMM.insert(link.getMMIndex());
+            }
             std::vector<real> charges;
             std::vector<int>  groups;
             for (const Index i : params.mtaIndices_)
@@ -346,7 +355,7 @@ public:
                             NotImplementedError("metatomic-oniom does not support perturbed "
                                                 "charges on embedded atoms."));
                 }
-                charges.push_back(atom.q);
+                charges.push_back(boundaryMM.count(i) ? 0 : atom.q);
                 groups.push_back(params.energyGroups_[i]);
             }
             // With several sites only pairs within a site are corrected, matching the exclusions
@@ -363,7 +372,7 @@ public:
                     .appendTextFormatted(
                             "Metatomic ONIOM: removing the classical Coulomb interaction between "
                             "the %zu embedded atoms%s, including pairs beyond rcoulomb.",
-                            params.mtaIndices_.size(),
+                            params.mtaIndices_.size() - boundaryMM.size(),
                             params.numSites() > 1
                                     ? formatString(" within each of %d sites", params.numSites()).c_str()
                                     : "");
