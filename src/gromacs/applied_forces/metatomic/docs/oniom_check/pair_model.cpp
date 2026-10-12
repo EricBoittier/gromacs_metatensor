@@ -26,6 +26,7 @@
 #include <metatensor.hpp>
 #include <metatomic.hpp>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -97,7 +98,7 @@ public:
     }
 
     std::vector<metatensor::TensorMap> execute_inner(const std::vector<metatomic::System>& systems,
-                                                     const metatensor::Labels* selected,
+                                                     std::optional<metatensor::Labels> selected,
                                                      const std::vector<metatomic::Quantity>& /*outputs*/) override
     {
         // one energy block for all systems: a row per system, or per selected atom
@@ -155,7 +156,7 @@ public:
             {
                 systemRow = newRow({ sys });
             }
-            else if (selected != nullptr)
+            else if (selected)
             {
                 const auto values = selected->values_cpu();
                 for (size_t k = 0; k < selected->count(); ++k)
