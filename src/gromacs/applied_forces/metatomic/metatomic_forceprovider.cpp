@@ -426,6 +426,10 @@ struct MetatomicData
 
     //! With domain decomposition, exchange only the atoms each rank needs
     //! (GMX_METATOMIC_DISTRIBUTED): see calculateForcesDistributed().
+    //! The pair labels are checked for uniqueness on the first evaluation only; GROMACS's
+    //! pair lists and the cap pairs do not change in kind afterwards
+    bool pairLabelsChecked = false;
+
     bool   distributed      = false;
     double distributedRange = 0.0; //!< the model's interaction range, nm
     //! Pair builder (GMX_METATOMIC_DIST_NL: cells or vesin), rebuild interval in steps
@@ -2636,24 +2640,70 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 }
             };
 
-            for (int64_t k = 0; k < nHalf; ++k)
+            // GROMACS's pairs, by all OpenMP threads: each counts its slice, then writes it at its
+            // offset (the order of pairs does not matter to the model)
             {
-                const int32_t ai = pairlistMta_[2 * k];
-                const int32_t aj = pairlistMta_[2 * k + 1];
-                if (!links.empty() && (isCapRow[ai] || isCapRow[aj]))
+                const int  threads = std::max(1, gmx_omp_get_max_threads());
+                const auto chunk   = (nHalf + threads - 1) / threads;
+                const int  copies  = full ? 2 : 1;
+                const auto keep    = [&](int64_t k, double* d)
                 {
-                    continue; // the GROMACS pair is for the MM atom, not its cap
-                }
-                const IVec& n     = cellShiftsMta_[k];
-                const RVec  shift = cellShiftVector(inputs.box_, n);
-                const double dx = static_cast<double>(positions_[aj][0] - positions_[ai][0] + shift[0]);
-                const double dy = static_cast<double>(positions_[aj][1] - positions_[ai][1] + shift[1]);
-                const double dz = static_cast<double>(positions_[aj][2] - positions_[ai][2] + shift[2]);
-                if (strict && dx * dx + dy * dy + dz * dz > cutoff2)
+                    const int32_t ai = pairlistMta_[2 * k];
+                    const int32_t aj = pairlistMta_[2 * k + 1];
+                    if (!links.empty() && (isCapRow[ai] || isCapRow[aj]))
+                    {
+                        return false; // the GROMACS pair is for the MM atom, not its cap
+                    }
+                    const RVec shift = cellShiftVector(inputs.box_, cellShiftsMta_[k]);
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        d[c] = static_cast<double>(positions_[aj][c] - positions_[ai][c] + shift[c]);
+                    }
+                    return !strict || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= cutoff2;
+                };
+                std::vector<int64_t> offset(threads + 1, 0);
+#pragma omp parallel for num_threads(threads) schedule(static)
+                for (int t = 0; t < threads; ++t)
                 {
-                    continue;
+                    int64_t count = 0;
+                    double  d[3];
+                    for (int64_t k = t * chunk; k < std::min(nHalf, (t + 1) * chunk); ++k)
+                    {
+                        count += keep(k, d) ? 1 : 0;
+                    }
+                    offset[t + 1] = count;
                 }
-                addPair(ai, aj, n, dx, dy, dz);
+                for (int t = 0; t < threads; ++t)
+                {
+                    offset[t + 1] += offset[t];
+                }
+                nlSamplesBuffer_.resize(static_cast<size_t>(5 * copies * offset[threads]));
+                nlVectorsBuffer_.resize(static_cast<size_t>(3 * copies * offset[threads]));
+#pragma omp parallel for num_threads(threads) schedule(static)
+                for (int t = 0; t < threads; ++t)
+                {
+                    int64_t row = copies * offset[t];
+                    double  d[3];
+                    for (int64_t k = t * chunk; k < std::min(nHalf, (t + 1) * chunk); ++k)
+                    {
+                        if (!keep(k, d))
+                        {
+                            continue;
+                        }
+                        const int32_t ai = pairlistMta_[2 * k], aj = pairlistMta_[2 * k + 1];
+                        const IVec&   n  = cellShiftsMta_[k];
+                        int32_t*      o  = nlSamplesBuffer_.data() + 5 * row;
+                        double*       v  = nlVectorsBuffer_.data() + 3 * row;
+                        o[0] = ai, o[1] = aj, o[2] = n[XX], o[3] = n[YY], o[4] = n[ZZ];
+                        v[0] = d[0], v[1] = d[1], v[2] = d[2];
+                        if (full)
+                        {
+                            o[5] = aj, o[6] = ai, o[7] = -n[XX], o[8] = -n[YY], o[9] = -n[ZZ];
+                            v[3] = -d[0], v[4] = -d[1], v[5] = -d[2];
+                        }
+                        row += copies;
+                    }
+                }
             }
 
             // Cap pairs, from the cap positions (minimum image), always within the cutoff.
@@ -2684,10 +2734,15 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                                        const std::vector<double>&  vectors)
             {
                 const int64_t nPairs  = static_cast<int64_t>(vectors.size() / 3);
-                auto          samples = metatensor::Labels(
-                        data_->nlSampleNames,
-                        nPairs == 0 ? nullptr : sampleValues.data(),
-                        static_cast<size_t>(nPairs));
+                // checked once; the pairs are unique by construction after that
+                auto samples = data_->pairLabelsChecked
+                                       ? metatensor::Labels(data_->nlSampleNames,
+                                                            nPairs == 0 ? nullptr : sampleValues.data(),
+                                                            static_cast<size_t>(nPairs),
+                                                            metatensor::assume_unique{})
+                                       : metatensor::Labels(data_->nlSampleNames,
+                                                            nPairs == 0 ? nullptr : sampleValues.data(),
+                                                            static_cast<size_t>(nPairs));
                 std::vector<metatensor::Labels> components;
                 components.push_back(metatensor::Labels({ "xyz" }, xyzValues, 3));
                 auto properties = metatensor::Labels({ "distance" }, &distanceValue, 1);
@@ -2739,6 +2794,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             }
         }
         buildNLTimer.stop();
+        data_->pairLabelsChecked = true;
 
         // With domain decomposition, each rank returns the rows of homeRow; with several sites,
         // whole sites instead.
