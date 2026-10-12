@@ -1463,6 +1463,72 @@ void MetatomicForceProvider::logSiteAssignment(const std::vector<std::vector<int
                     joinStrings(perRank, "; ").c_str());
 }
 
+/*! Pairs within `cutoff` as metatomic pair-list samples (first, second, cell shift) and vectors in
+ * the model dtype, packed by all OpenMP threads: each counts its slice, then writes it at its
+ * offset. A full list gets every pair in both directions. */
+template<typename T>
+static void packPairs(const std::vector<int32_t>& first,
+                      const std::vector<int32_t>& second,
+                      const std::vector<IVec>&    shifts,
+                      const std::vector<double>&  vectors,
+                      double                      cutoff,
+                      bool                        full,
+                      std::vector<int32_t>*       samplesOut,
+                      std::vector<T>*             vectorsOut)
+{
+    const size_t n       = first.size();
+    const double cut2    = cutoff * cutoff;
+    const int    threads = std::max(1, gmx_omp_get_max_threads());
+    const size_t chunk   = (n + threads - 1) / threads;
+    const int    copies  = full ? 2 : 1;
+    const auto   within  = [&](size_t k)
+    {
+        const double* d = vectors.data() + 3 * k;
+        return d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= cut2;
+    };
+    std::vector<size_t> offset(threads + 1, 0);
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int t = 0; t < threads; ++t)
+    {
+        size_t count = 0;
+        for (size_t k = t * chunk; k < std::min(n, (t + 1) * chunk); ++k)
+        {
+            count += within(k) ? 1 : 0;
+        }
+        offset[t + 1] = count;
+    }
+    for (int t = 0; t < threads; ++t)
+    {
+        offset[t + 1] += offset[t];
+    }
+    samplesOut->resize(5 * copies * offset[threads]);
+    vectorsOut->resize(3 * copies * offset[threads]);
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int t = 0; t < threads; ++t)
+    {
+        size_t row = copies * offset[t];
+        for (size_t k = t * chunk; k < std::min(n, (t + 1) * chunk); ++k)
+        {
+            if (!within(k))
+            {
+                continue;
+            }
+            const IVec&   s = shifts[k];
+            const double* d = vectors.data() + 3 * k;
+            int32_t*      o = samplesOut->data() + 5 * row;
+            T*            v = vectorsOut->data() + 3 * row;
+            o[0] = first[k], o[1] = second[k], o[2] = s[XX], o[3] = s[YY], o[4] = s[ZZ];
+            v[0] = static_cast<T>(d[0]), v[1] = static_cast<T>(d[1]), v[2] = static_cast<T>(d[2]);
+            if (full)
+            {
+                o[5] = second[k], o[6] = first[k], o[7] = -s[XX], o[8] = -s[YY], o[9] = -s[ZZ];
+                v[3] = -v[0], v[4] = -v[1], v[5] = -v[2];
+            }
+            row += copies;
+        }
+    }
+}
+
 /* Distributed evaluation with domain decomposition (GMX_METATOMIC_DISTRIBUTED).
  *
  * A home atom's energy depends only on atoms within the model's interaction range R. Each rank
@@ -1893,45 +1959,47 @@ void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput
     const int32_t distanceValue = 0;
     for (size_t r = 0; r < st.pairLists.size(); ++r)
     {
-        const auto&          request = st.pairLists[r];
-        const double         cut2    = st.cutoffNm[r] * st.cutoffNm[r];
-        std::vector<int32_t> samples;
-        std::vector<double>  vectors;
-        for (size_t k = 0; k < st.distPairI.size(); ++k)
-        {
-            const double* d = pairD.data() + 3 * k;
-            if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > cut2)
-            {
-                continue;
-            }
-            const IVec& n = st.distPairShift[k];
-            samples.insert(samples.end(), { st.distPairI[k], st.distPairJ[k], n[XX], n[YY], n[ZZ] });
-            vectors.insert(vectors.end(), { d[0], d[1], d[2] });
-            if (request.full_list())
-            {
-                samples.insert(samples.end(), { st.distPairJ[k], st.distPairI[k], -n[XX], -n[YY], -n[ZZ] });
-                vectors.insert(vectors.end(), { -d[0], -d[1], -d[2] });
-            }
-        }
-        const int64_t nPairs = static_cast<int64_t>(vectors.size() / 3);
-        const auto    shape  = std::vector<uintptr_t>{ static_cast<uintptr_t>(nPairs), 3, 1 };
+        const auto&                                request = st.pairLists[r];
+        std::vector<int32_t>                       samples;
         std::unique_ptr<metatensor::DataArrayBase> values;
-        if (modelIsDouble)
+        size_t                                     nPairs = 0;
         {
-            values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::move(vectors));
+            MetatomicTimer timer("distPack", mpiComm_);
+            if (modelIsDouble)
+            {
+                std::vector<double> v;
+                packPairs(st.distPairI, st.distPairJ, st.distPairShift, pairD, st.cutoffNm[r],
+                          request.full_list(), &samples, &v);
+                nPairs = v.size() / 3;
+                values = std::make_unique<metatensor::SimpleDataArray<double>>(
+                        std::vector<uintptr_t>{ nPairs, 3, 1 }, std::move(v));
+            }
+            else
+            {
+                std::vector<float> v;
+                packPairs(st.distPairI, st.distPairJ, st.distPairShift, pairD, st.cutoffNm[r],
+                          request.full_list(), &samples, &v);
+                nPairs = v.size() / 3;
+                values = std::make_unique<metatensor::SimpleDataArray<float>>(
+                        std::vector<uintptr_t>{ nPairs, 3, 1 }, std::move(v));
+            }
         }
-        else
+        // the pairs are unique by construction (i < j, or both directions with opposite shifts)
+        std::optional<metatensor::TensorBlock> block;
         {
-            values = std::make_unique<metatensor::SimpleDataArray<float>>(
-                    shape, std::vector<float>(vectors.begin(), vectors.end()));
+            MetatomicTimer timer("distLabels", mpiComm_);
+            block.emplace(std::move(values),
+                          metatensor::Labels(st.nlSampleNames,
+                                             nPairs == 0 ? nullptr : samples.data(),
+                                             nPairs,
+                                             metatensor::assume_unique{}),
+                          std::vector<metatensor::Labels>{ metatensor::Labels({ "xyz" }, xyzValues, 3) },
+                          metatensor::Labels({ "distance" }, &distanceValue, 1));
         }
-        system.add_pairs(request,
-                         metatensor::TensorBlock(std::move(values),
-                                                 metatensor::Labels(st.nlSampleNames,
-                                                                    nPairs == 0 ? nullptr : samples.data(),
-                                                                    static_cast<size_t>(nPairs)),
-                                                 { metatensor::Labels({ "xyz" }, xyzValues, 3) },
-                                                 metatensor::Labels({ "distance" }, &distanceValue, 1)));
+        {
+            MetatomicTimer timer("distAddPairs", mpiComm_);
+            system.add_pairs(request, std::move(*block));
+        }
     }
     std::vector<int32_t> selectedRows(2 * static_cast<size_t>(nHome), 0);
     for (int32_t i = 0; i < nHome; ++i)
