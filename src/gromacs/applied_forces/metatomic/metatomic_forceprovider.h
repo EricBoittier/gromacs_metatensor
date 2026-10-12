@@ -122,6 +122,12 @@ public:
      */
     void calculateForces(const ForceProviderInput& inputs, ForceProviderOutput* outputs) override;
 
+private:
+    //! The GMX_METATOMIC_DISTRIBUTED path of calculateForces() with domain decomposition
+    void calculateForcesDistributed(const ForceProviderInput& inputs, ForceProviderOutput* outputs);
+
+public:
+
     //! Gather atom numbers and indices. Triggered on AtomsRedistributed signal.
     void gatherAtomNumbersIndices(const MDModulesAtomsRedistributedSignal& signal);
 

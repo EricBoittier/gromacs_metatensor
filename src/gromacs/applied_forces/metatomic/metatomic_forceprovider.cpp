@@ -418,6 +418,11 @@ struct MetatomicData
     bool haloSplit = false;
     int  haloHops  = 0;
 
+    //! With domain decomposition, exchange only the atoms each rank needs
+    //! (GMX_METATOMIC_DISTRIBUTED): see calculateForcesDistributed().
+    bool   distributed      = false;
+    double distributedRange = 0.0; //!< the model's interaction range, nm
+
     //! Home-atom selection. Rebuilt when numHomeMta_ changes.
     std::optional<metatensor::Labels> selectedAtoms;
     int32_t                           selectedCount = -1;
@@ -720,6 +725,28 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
                 .asParagraph()
                 .appendTextFormatted("Metatomic: %zu link atoms at the ML/MM boundary",
                                      linkFrontiers_.size());
+    }
+
+    if (const char* env = std::getenv("GMX_METATOMIC_DISTRIBUTED"); env && std::string(env) != "0")
+    {
+        const double range = data_->capabilities.interaction_range() * data_->lengthToNm;
+        if (!linkFrontiers_.empty() || options_.params_.numSites() > 1 || !data_->systemInputs.empty()
+            || data_->nonConservative || !std::isfinite(range) || data_->pairLists.empty())
+        {
+            GMX_THROW(NotImplementedError(
+                    "GMX_METATOMIC_DISTRIBUTED needs one ML region without link atoms, a "
+                    "conservative model with a finite interaction range and pair lists, and no "
+                    "per-system inputs."));
+        }
+        data_->distributed      = true;
+        data_->distributedRange = range;
+        GMX_LOG(logger_.info)
+                .asParagraph()
+                .appendTextFormatted(
+                        "Metatomic: distributed evaluation with domain decomposition; each rank "
+                        "receives the ML atoms within %.3f nm (the interaction range) of its home "
+                        "atoms, builds their pairs, and returns the forces on borrowed atoms.",
+                        range);
     }
 
     GMX_LOG(logger_.info)
@@ -1387,6 +1414,416 @@ void MetatomicForceProvider::logSiteAssignment(const std::vector<std::vector<int
                     joinStrings(perRank, "; ").c_str());
 }
 
+/* Distributed evaluation with domain decomposition (GMX_METATOMIC_DISTRIBUTED).
+ *
+ * A home atom's energy depends only on atoms within the model's interaction range R. Each rank
+ * shares the bounding box of its home ML atoms; every rank then sends it its home atoms, and
+ * their periodic images, within R of that box (a rank sends images of its own atoms to itself).
+ * The receiver evaluates one non-periodic system of its home atoms and these explicit images,
+ * with pairs from a cell list, selecting its home atoms, and returns the forces on the received
+ * rows to their owners. With explicit image coordinates the strain gradient of a rank's home
+ * energy is its share of the periodic virial, so energies and virials sum over ranks.
+ * Communication and work per rank scale with its home atoms and their halo, not the whole region.
+ */
+void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput& inputs,
+                                                        ForceProviderOutput*      outputs)
+{
+    MetatomicTimer totalTimer("distributed", mpiComm_);
+    const int      nRanks = mpiComm_.size();
+    const int      rank   = mpiComm_.rank();
+    const int32_t  nHome  = numHomeMta_;
+    const double   range  = data_->distributedRange;
+    const double   range2 = range * range;
+
+    // 1. Every rank's home bounding box (an empty rank's is inverted, so nothing is sent to it)
+    std::vector<double> bounds(6 * nRanks, 0.0);
+    {
+        double* own = bounds.data() + 6 * rank;
+        for (int d = 0; d < 3; ++d)
+        {
+            own[d]     = 1e30;
+            own[3 + d] = -1e30;
+        }
+        for (int32_t i = 0; i < nHome; ++i)
+        {
+            for (int d = 0; d < 3; ++d)
+            {
+                own[d]     = std::min(own[d], static_cast<double>(positions_[i][d]));
+                own[3 + d] = std::max(own[3 + d], static_cast<double>(positions_[i][d]));
+            }
+        }
+        mpiComm_.sumReduce(bounds.size(), bounds.data());
+    }
+
+    // 2. What to send to each rank: home atoms and images within R of its box
+    std::vector<RVec> shifts;
+    for (int a = -1; a <= 1; ++a)
+    {
+        for (int b = -1; b <= 1; ++b)
+        {
+            for (int c = -1; c <= 1; ++c)
+            {
+                shifts.push_back(cellShiftVector(inputs.box_, IVec{ a, b, c }));
+            }
+        }
+    }
+    const int                         zeroShift = 13; // (0, 0, 0)
+    std::vector<std::vector<int32_t>> sendAtom(nRanks);
+    std::vector<std::vector<double>>  sendPos(nRanks);
+    {
+        MetatomicTimer timer("distSelect", mpiComm_);
+        for (int dest = 0; dest < nRanks; ++dest)
+        {
+            const double* lo = bounds.data() + 6 * dest;
+            const double* hi = lo + 3;
+            for (int s = 0; s < static_cast<int>(shifts.size()); ++s)
+            {
+                if (dest == rank && s == zeroShift)
+                {
+                    continue; // the home atoms themselves
+                }
+                for (int32_t i = 0; i < nHome; ++i)
+                {
+                    double d2 = 0.0;
+                    double p[3];
+                    for (int d = 0; d < 3; ++d)
+                    {
+                        p[d]           = static_cast<double>(positions_[i][d] + shifts[s][d]);
+                        const double g = std::max({ lo[d] - p[d], 0.0, p[d] - hi[d] });
+                        d2 += g * g;
+                    }
+                    if (d2 <= range2)
+                    {
+                        sendAtom[dest].push_back(i);
+                        sendPos[dest].insert(sendPos[dest].end(), { p[0], p[1], p[2] });
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Exchange: counts, then positions and (type, ML index) of every sent row
+    std::vector<int> sendCount(nRanks), recvCount(nRanks), sendDispl(nRanks), recvDispl(nRanks);
+    for (int r = 0; r < nRanks; ++r)
+    {
+        sendCount[r] = static_cast<int>(sendAtom[r].size());
+    }
+    MPI_Alltoall(sendCount.data(), 1, MPI_INT, recvCount.data(), 1, MPI_INT, mpiComm_.comm());
+    int nSend = 0, nRecv = 0;
+    for (int r = 0; r < nRanks; ++r)
+    {
+        sendDispl[r] = nSend;
+        recvDispl[r] = nRecv;
+        nSend += sendCount[r];
+        nRecv += recvCount[r];
+    }
+    const auto scaled = [nRanks](const std::vector<int>& v, int k)
+    {
+        std::vector<int> out(nRanks);
+        for (int r = 0; r < nRanks; ++r)
+        {
+            out[r] = k * v[r];
+        }
+        return out;
+    };
+    std::vector<double>  sendPosFlat, recvPos(3 * static_cast<size_t>(nRecv));
+    std::vector<int32_t> sendIds, recvIds(2 * static_cast<size_t>(nRecv));
+    for (int r = 0; r < nRanks; ++r)
+    {
+        sendPosFlat.insert(sendPosFlat.end(), sendPos[r].begin(), sendPos[r].end());
+        for (const int32_t i : sendAtom[r])
+        {
+            sendIds.insert(sendIds.end(), { atomNumbers_[i], mtaToGlobalMta_[i] });
+        }
+    }
+    {
+        MetatomicTimer timer("distExchange", mpiComm_);
+        const auto     sc3 = scaled(sendCount, 3), sd3 = scaled(sendDispl, 3);
+        const auto     rc3 = scaled(recvCount, 3), rd3 = scaled(recvDispl, 3);
+        MPI_Alltoallv(sendPosFlat.data(), sc3.data(), sd3.data(), MPI_DOUBLE, recvPos.data(),
+                      rc3.data(), rd3.data(), MPI_DOUBLE, mpiComm_.comm());
+        const auto sc2 = scaled(sendCount, 2), sd2 = scaled(sendDispl, 2);
+        const auto rc2 = scaled(recvCount, 2), rd2 = scaled(recvDispl, 2);
+        MPI_Alltoallv(sendIds.data(), sc2.data(), sd2.data(), MPI_INT, recvIds.data(), rc2.data(),
+                      rd2.data(), MPI_INT, mpiComm_.comm());
+    }
+
+    // 4. Local rows: home atoms, then the received ones
+    const int32_t        nRows = nHome + nRecv;
+    std::vector<double>  x(3 * static_cast<size_t>(nRows));
+    std::vector<int32_t> types(nRows), globalMta(nRows);
+    for (int32_t i = 0; i < nHome; ++i)
+    {
+        for (int d = 0; d < 3; ++d)
+        {
+            x[3 * i + d] = static_cast<double>(positions_[i][d]);
+        }
+        types[i]     = atomNumbers_[i];
+        globalMta[i] = mtaToGlobalMta_[i];
+    }
+    for (int32_t k = 0; k < nRecv; ++k)
+    {
+        std::copy_n(recvPos.begin() + 3 * k, 3, x.begin() + 3 * (nHome + k));
+        types[nHome + k]     = recvIds[2 * k];
+        globalMta[nHome + k] = recvIds[2 * k + 1];
+    }
+    if (!haloLogged_)
+    {
+        std::vector<int> counts(2 * nRanks, 0);
+        counts[2 * rank]     = nHome;
+        counts[2 * rank + 1] = nRecv;
+        mpiComm_.sumReduce(ArrayRef<int>(counts));
+        std::vector<std::string> perRank;
+        for (int r = 0; r < nRanks; ++r)
+        {
+            perRank.push_back(formatString("rank %d %d + %d", r, counts[2 * r], counts[2 * r + 1]));
+        }
+        GMX_LOG(logger_.info)
+                .asParagraph()
+                .appendTextFormatted("Metatomic distributed, first step, home + received rows: %s",
+                                     joinStrings(perRank, "; ").c_str());
+        haloLogged_ = true;
+    }
+
+    // 5. Pairs within the largest cutoff, from a cell list over the local rows
+    const double maxCutoff = *std::max_element(data_->cutoffNm.begin(), data_->cutoffNm.end());
+    std::vector<int32_t> pairI, pairJ;
+    std::vector<double>  pairD;
+    {
+        MetatomicTimer timer("distPairs", mpiComm_);
+        double         lo[3] = { 1e30, 1e30, 1e30 }, hi[3] = { -1e30, -1e30, -1e30 };
+        for (int32_t i = 0; i < nRows; ++i)
+        {
+            for (int d = 0; d < 3; ++d)
+            {
+                lo[d] = std::min(lo[d], x[3 * i + d]);
+                hi[d] = std::max(hi[d], x[3 * i + d]);
+            }
+        }
+        int nc[3];
+        for (int d = 0; d < 3; ++d)
+        {
+            nc[d] = std::max(1, static_cast<int>((hi[d] - lo[d]) / maxCutoff));
+        }
+        const auto cellOf = [&](int32_t i, int d)
+        {
+            return std::min(nc[d] - 1, static_cast<int>((x[3 * i + d] - lo[d]) / maxCutoff));
+        };
+        const size_t         nCells = static_cast<size_t>(nc[0]) * nc[1] * nc[2];
+        std::vector<int32_t> head(nCells, -1), next(nRows, -1);
+        for (int32_t i = 0; i < nRows; ++i)
+        {
+            const size_t c = (static_cast<size_t>(cellOf(i, 0)) * nc[1] + cellOf(i, 1)) * nc[2] + cellOf(i, 2);
+            next[i]        = head[c];
+            head[c]        = i;
+        }
+        const double cut2 = maxCutoff * maxCutoff;
+        for (int32_t i = 0; i < nRows; ++i)
+        {
+            const int ci[3] = { cellOf(i, 0), cellOf(i, 1), cellOf(i, 2) };
+            for (int a = std::max(0, ci[0] - 1); a <= std::min(nc[0] - 1, ci[0] + 1); ++a)
+            {
+                for (int b = std::max(0, ci[1] - 1); b <= std::min(nc[1] - 1, ci[1] + 1); ++b)
+                {
+                    for (int c = std::max(0, ci[2] - 1); c <= std::min(nc[2] - 1, ci[2] + 1); ++c)
+                    {
+                        for (int32_t j = head[(static_cast<size_t>(a) * nc[1] + b) * nc[2] + c]; j >= 0; j = next[j])
+                        {
+                            if (j <= i)
+                            {
+                                continue;
+                            }
+                            const double dx = x[3 * j] - x[3 * i], dy = x[3 * j + 1] - x[3 * i + 1],
+                                         dz = x[3 * j + 2] - x[3 * i + 2];
+                            if (dx * dx + dy * dy + dz * dz <= cut2)
+                            {
+                                pairI.push_back(i);
+                                pairJ.push_back(j);
+                                pairD.insert(pairD.end(), { dx, dy, dz });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. One non-periodic system of the local rows, home atoms selected
+    const bool       modelIsDouble = data_->useFloat64;
+    const DLDataType floatType     = modelIsDouble ? DLDataType{ kDLFloat, 64, 1 } : DLDataType{ kDLFloat, 32, 1 };
+    std::vector<float> x32;
+    void*              positionData = x.data();
+    if (!modelIsDouble)
+    {
+        x32.assign(x.begin(), x.end());
+        positionData = x32.data();
+    }
+    std::array<double, 9>  cell64{};
+    std::array<float, 9>   cell32{};
+    std::array<uint8_t, 3> noPbc = { 0, 0, 0 };
+    metatomic::System      system("nm",
+                             wrap_dlpack(types.data(), { nRows }, { kDLInt, 32, 1 }),
+                             wrap_dlpack(positionData, { nRows, 3 }, floatType),
+                             wrap_dlpack(modelIsDouble ? static_cast<void*>(cell64.data())
+                                                       : static_cast<void*>(cell32.data()),
+                                         { 3, 3 },
+                                         floatType),
+                             wrap_dlpack(noPbc.data(), { 3 }, { kDLBool, 8, 1 }));
+    for (const auto& input : data_->chargeInputs)
+    {
+        const double toUnit =
+                input.unit().empty() ? 1.0 : metatomic::unit_conversion_factor("e", input.unit());
+        std::vector<double>  charges(nRows);
+        std::vector<int32_t> samples(2 * static_cast<size_t>(nRows), 0);
+        for (int32_t i = 0; i < nRows; ++i)
+        {
+            charges[i]         = toUnit * options_.params_.mmCharges_[options_.params_.mtaIndices_[globalMta[i]]];
+            samples[2 * i + 1] = i;
+        }
+        const int32_t zero  = 0;
+        const auto    shape = std::vector<uintptr_t>{ static_cast<uintptr_t>(nRows), 1 };
+        std::unique_ptr<metatensor::DataArrayBase> values;
+        if (modelIsDouble)
+        {
+            values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::move(charges));
+        }
+        else
+        {
+            values = std::make_unique<metatensor::SimpleDataArray<float>>(
+                    shape, std::vector<float>(charges.begin(), charges.end()));
+        }
+        std::vector<metatensor::TensorBlock> blocks;
+        blocks.emplace_back(std::move(values),
+                            metatensor::Labels({ "system", "atom" }, samples.data(), static_cast<size_t>(nRows)),
+                            std::vector<metatensor::Labels>{},
+                            metatensor::Labels({ "charge" }, &zero, 1));
+        system.add_custom_data(input.name(),
+                               metatensor::TensorMap(metatensor::Labels({ "_" }, &zero, 1), std::move(blocks)));
+    }
+    const int32_t xyzValues[3]  = { 0, 1, 2 };
+    const int32_t distanceValue = 0;
+    for (size_t r = 0; r < data_->pairLists.size(); ++r)
+    {
+        const auto&          request = data_->pairLists[r];
+        const double         cut2    = data_->cutoffNm[r] * data_->cutoffNm[r];
+        std::vector<int32_t> samples;
+        std::vector<double>  vectors;
+        for (size_t k = 0; k < pairI.size(); ++k)
+        {
+            const double* d = pairD.data() + 3 * k;
+            if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > cut2)
+            {
+                continue;
+            }
+            samples.insert(samples.end(), { pairI[k], pairJ[k], 0, 0, 0 });
+            vectors.insert(vectors.end(), { d[0], d[1], d[2] });
+            if (request.full_list())
+            {
+                samples.insert(samples.end(), { pairJ[k], pairI[k], 0, 0, 0 });
+                vectors.insert(vectors.end(), { -d[0], -d[1], -d[2] });
+            }
+        }
+        const int64_t nPairs = static_cast<int64_t>(vectors.size() / 3);
+        const auto    shape  = std::vector<uintptr_t>{ static_cast<uintptr_t>(nPairs), 3, 1 };
+        std::unique_ptr<metatensor::DataArrayBase> values;
+        if (modelIsDouble)
+        {
+            values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::move(vectors));
+        }
+        else
+        {
+            values = std::make_unique<metatensor::SimpleDataArray<float>>(
+                    shape, std::vector<float>(vectors.begin(), vectors.end()));
+        }
+        system.add_pairs(request,
+                         metatensor::TensorBlock(std::move(values),
+                                                 metatensor::Labels(data_->nlSampleNames,
+                                                                    nPairs == 0 ? nullptr : samples.data(),
+                                                                    static_cast<size_t>(nPairs)),
+                                                 { metatensor::Labels({ "xyz" }, xyzValues, 3) },
+                                                 metatensor::Labels({ "distance" }, &distanceValue, 1)));
+    }
+    std::vector<int32_t> selectedRows(2 * static_cast<size_t>(nHome), 0);
+    for (int32_t i = 0; i < nHome; ++i)
+    {
+        selectedRows[2 * i + 1] = i;
+    }
+    const metatensor::Labels selected(
+            { "system", "atom" }, nHome == 0 ? nullptr : selectedRows.data(), static_cast<size_t>(nHome));
+
+    // 7. Model, energy, forces on every local row, virial
+    std::vector<metatomic::System> systems;
+    systems.push_back(std::move(system));
+    std::vector<metatensor::TensorMap> modelOutputs;
+    {
+        MetatomicTimer timer("execute_model", mpiComm_);
+        try
+        {
+            modelOutputs = metatomic::execute_model(
+                    *data_->model, systems, selected, data_->requested, data_->checkConsistency);
+        }
+        catch (const std::exception& e)
+        {
+            GMX_THROW(APIError("[Metatomic] Model evaluation failed: " + std::string(e.what())));
+        }
+    }
+    double              energy = 0.0;
+    matrix              virialMatrix;
+    std::vector<double> forces(3 * static_cast<size_t>(nRows), 0.0);
+    clear_mat(virialMatrix);
+    auto& energyMap = modelOutputs[data_->energyIndex];
+    for (size_t b = 0; b < energyMap.keys().count(); ++b)
+    {
+        auto block = energyMap.block_by_id(b);
+        energy += modelIsDouble ? sum_block<double>(block) : sum_block<float>(block);
+        auto         posGrad    = block.gradient("positions");
+        auto         strainGrad = block.gradient("strain");
+        const double forceScale = -1.0 / data_->lengthToNm;
+        if (modelIsDouble)
+        {
+            add_atom_rows<double>(posGrad, 2, nRows, forceScale, &forces);
+            add_strain<double>(strainGrad, virialMatrix);
+        }
+        else
+        {
+            add_atom_rows<float>(posGrad, 2, nRows, forceScale, &forces);
+            add_strain<float>(strainGrad, virialMatrix);
+        }
+    }
+
+    // 8. Forces: home rows directly, received rows back to their owners
+    for (int32_t i = 0; i < nHome; ++i)
+    {
+        for (int d = 0; d < 3; ++d)
+        {
+            outputs->forceWithVirial_.force_[mtaToGmxLocal_[i]][d] += static_cast<real>(forces[3 * i + d]);
+        }
+    }
+    {
+        MetatomicTimer      timer("distReturn", mpiComm_);
+        std::vector<double> back(3 * static_cast<size_t>(nSend));
+        const auto          sc3 = scaled(sendCount, 3), sd3 = scaled(sendDispl, 3);
+        const auto          rc3 = scaled(recvCount, 3), rd3 = scaled(recvDispl, 3);
+        MPI_Alltoallv(forces.data() + 3 * static_cast<size_t>(nHome), rc3.data(), rd3.data(),
+                      MPI_DOUBLE, back.data(), sc3.data(), sd3.data(), MPI_DOUBLE, mpiComm_.comm());
+        size_t k = 0;
+        for (int r = 0; r < nRanks; ++r)
+        {
+            for (const int32_t i : sendAtom[r])
+            {
+                for (int d = 0; d < 3; ++d)
+                {
+                    outputs->forceWithVirial_.force_[mtaToGmxLocal_[i]][d] += static_cast<real>(back[3 * k + d]);
+                }
+                ++k;
+            }
+        }
+    }
+
+    outputs->enerd_.term[InteractionFunction::MetatomicPotentialEnergy] = static_cast<real>(energy);
+    outputs->forceWithVirial_.addVirialContribution(virialMatrix);
+}
+
 void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, ForceProviderOutput* outputs)
 {
     MetatomicTimer totalTimer("calculateForces", mpiComm_);
@@ -1397,6 +1834,11 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         gatherAtomPositions(inputs.x_);
     }
     copy_mat(inputs.box_, box_);
+    if (data_->distributed && mpiComm_.isParallel())
+    {
+        calculateForcesDistributed(inputs, outputs);
+        return;
+    }
 
     // Newton NL mode: in parallel, each rank needs ALL pairs involving its
     // home atoms (not just the ones assigned by the eighth-shell DD
