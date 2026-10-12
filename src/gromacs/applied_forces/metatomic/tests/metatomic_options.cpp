@@ -46,6 +46,7 @@
 
 #include <filesystem>
 #include <map>
+#include <set>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -382,6 +383,54 @@ TEST_F(MetatomicOptionsTest, OniomEmbeddingAppliesSubtractiveTopologyPreprocessi
     expectLogMessage("Number of angles removed: 7\n");
     expectLogMessage("Number of dihedrals removed: 3\n");
     EXPECT_NO_THROW(options.modifyTopology(mtop.get()));
+}
+
+TEST_F(MetatomicOptionsTest, LinkAtomsKeepTheCutBondsInMM)
+{
+    // The same ML atoms as above: with link atoms the topology surgery must be the same, so every
+    // bond cut by the boundary stays a real MM bond, and the boundary MM atoms only become rows
+    // of the model, for their caps.
+    const std::vector<int> metatomicAtomIndices = { 8, 9, 10, 11, 12, 13 };
+    auto                   mtop                 = makeMtopFromFile("alanine_vacuo", "");
+
+    WarningHandler   wi(true, 0);
+    MetatomicOptions options = buildOptions(
+            metatomicAtomIndices, &wi, { { "oniom", "true" }, { "link-atoms", "true" } });
+
+    expectLogMessage("Metatomic potential interface is active, topology was modified!");
+    expectLogMessage("Number of embedded Metatomic atoms: 6\nNumber of regular atoms: 16\n");
+    expectLogMessage("Number of exclusions made: 6\n");
+    expectLogMessage("Number of bonds removed: 8\n");
+    expectLogMessage("Number of InteractionFunction::ConnectBonds \\(type 5 bonds\\) added: 5\n");
+    expectLogMessage("Number of angles removed: 7\n");
+    expectLogMessage("Number of dihedrals removed: 3\n");
+    expectLogMessage("Metatomic: 2 link caps; the 2 boundary MM atoms keep their MM interactions");
+    EXPECT_NO_THROW(options.modifyTopology(mtop.get()));
+
+    const auto& links = options.parameters().linkFrontier_;
+    ASSERT_FALSE(links.empty());
+    std::set<int> boundary;
+    for (const auto& link : links)
+    {
+        boundary.insert(link.getMMIndex());
+    }
+    EXPECT_EQ(options.parameters().mtaIndices_.size(), metatomicAtomIndices.size() + boundary.size());
+
+    // every cut bond is still a harmonic bond (one molecule, so local and global indices agree)
+    ASSERT_EQ(mtop->molblock.size(), 1);
+    const auto& bonds = mtop->moltype[mtop->molblock[0].type].ilist[InteractionFunction::Bonds];
+    for (const auto& link : links)
+    {
+        bool found = false;
+        for (int k = 0; k < bonds.size(); k += 3)
+        {
+            const int i = bonds.iatoms[k + 1], j = bonds.iatoms[k + 2];
+            found = found
+                    || (std::min(i, j) == std::min(link.getEmbeddedIndex(), link.getMMIndex())
+                        && std::max(i, j) == std::max(link.getEmbeddedIndex(), link.getMMIndex()));
+        }
+        EXPECT_TRUE(found) << "cut bond " << link.getEmbeddedIndex() << "-" << link.getMMIndex();
+    }
 }
 
 TEST_F(MetatomicOptionsTest, LinkAtomsRequireOniomEmbedding)
