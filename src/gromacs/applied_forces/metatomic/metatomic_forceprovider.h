@@ -204,6 +204,8 @@ private:
                            const std::vector<int>&              siteSizes) const;
     //! Whether logSiteAssignment has run
     bool siteAssignmentLogged_ = false;
+    //! Whether the first halo-split selection has been logged
+    bool haloLogged_ = false;
 
     //! Distribute non-home forces via sparse indexed exchange (allgatherv pattern).
     //! Home forces are applied directly; only halo forces are communicated.

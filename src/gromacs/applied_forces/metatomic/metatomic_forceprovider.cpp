@@ -413,6 +413,11 @@ struct MetatomicData
     //! Requested per-system inputs (charge, spin_multiplicity), filled from the site options.
     std::vector<metatomic::Quantity> systemInputs;
 
+    //! With domain decomposition, evaluate only the home atoms and their receptive field
+    //! (GMX_METATOMIC_HALO_SPLIT): the atoms within haloHops pair-list hops of a home atom.
+    bool haloSplit = false;
+    int  haloHops  = 0;
+
     //! Home-atom selection. Rebuilt when numHomeMta_ changes.
     std::optional<metatensor::Labels> selectedAtoms;
     int32_t                           selectedCount = -1;
@@ -454,14 +459,20 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
     {
         deviceName = env;
     }
-    if (!deviceName.empty() && deviceName != "cpu")
+    // The engine always submits CPU buffers; the device is the plugin's, passed as a load option.
+    // "{rank}" becomes this rank's index, so cuda:{rank} puts each rank's model on its own GPU.
+    std::optional<std::string> loadOptions;
+    if (!deviceName.empty())
     {
-        GMX_LOG(logger_.warning)
+        for (auto at = deviceName.find("{rank}"); at != std::string::npos; at = deviceName.find("{rank}"))
+        {
+            deviceName.replace(at, 6, std::to_string(mpiComm_.rank()));
+        }
+        loadOptions = "{\"device\": \"" + deviceName + "\"}";
+        GMX_LOG(logger_.info)
                 .asParagraph()
-                .appendTextFormatted(
-                        "Metatomic device '%s' is a plugin concern. This engine "
-                        "submits CPU DLPack buffers.",
-                        deviceName.c_str());
+                .appendTextFormatted("Metatomic: model device '%s' (plugin load option)",
+                                     deviceName.c_str());
     }
 
     try
@@ -483,7 +494,7 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
             }
         }
         data_->model = std::make_unique<metatomic::ExternalModel>(
-                metatomic::load_model(options_.params_.modelPath_));
+                metatomic::load_model(options_.params_.modelPath_, loadOptions));
         data_->capabilities = data_->model->capabilities();
         data_->pairLists    = data_->model->requested_pair_lists();
     }
@@ -673,6 +684,33 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
                         formatAndJoin(options_.params_.siteChargeValues_, " ", StringFormatter("%g"))
                                 .c_str(),
                         formatAndJoin(options_.params_.siteSpinValues_, " ", StringFormatter("%d")).c_str());
+    }
+
+    if (const char* env = std::getenv("GMX_METATOMIC_HALO_SPLIT"); env && std::string(env) != "0")
+    {
+        const double range  = data_->capabilities.interaction_range() * data_->lengthToNm;
+        const double cutoff = data_->cutoffNm.empty()
+                                      ? 0.0
+                                      : *std::max_element(data_->cutoffNm.begin(), data_->cutoffNm.end());
+        if (!data_->systemInputs.empty() || data_->nonConservative || !std::isfinite(range)
+            || cutoff <= 0)
+        {
+            GMX_THROW(NotImplementedError(
+                    "GMX_METATOMIC_HALO_SPLIT needs a conservative model with a finite interaction "
+                    "range and pair lists, and no per-system inputs (a part of the system cannot "
+                    "take the whole system's charge or spin)."));
+        }
+        data_->haloSplit = true;
+        data_->haloHops  = static_cast<int>(std::ceil(range / cutoff - 1e-6));
+        GMX_LOG(logger_.info)
+                .asParagraph()
+                .appendTextFormatted(
+                        "Metatomic: with domain decomposition each rank evaluates its home atoms "
+                        "and the atoms within %d pair-list hops of them (interaction range %.3f nm, "
+                        "pair cutoff %.3f nm)",
+                        data_->haloHops,
+                        range,
+                        cutoff);
     }
 
     linkFrontiers_ = options_.params_.linkFrontier_;
@@ -1550,6 +1588,102 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         // atom's, and a cap's that of the MM atom it replaces (which joined its ML partner's site).
         const int  numSites  = options_.params_.numSites();
         const bool multiSite = numSites > 1;
+
+        // The rows this rank returns with domain decomposition: its home atoms plus the caps
+        // whose embedded atom is home; a home MM row whose caps all belong to non-home embedded
+        // atoms is left to the rank owning them.
+        std::vector<char> homeRow(nModel, 0);
+        if (useNewtonNL && !multiSite)
+        {
+            std::fill(homeRow.begin(), homeRow.begin() + numHomeMta_, 1);
+            for (const auto& link : links)
+            {
+                if (link.row < numHomeMta_)
+                {
+                    homeRow[link.row] = 0;
+                }
+            }
+            for (const auto& link : links)
+            {
+                if (link.embedded < numHomeMta_)
+                {
+                    homeRow[link.row] = 1;
+                }
+            }
+        }
+        // Halo split: one system of the home rows and their receptive field. A message-passing
+        // home atom depends on atoms at most haloHops pair-list hops away, so the rows beyond
+        // change nothing it returns. A cap moves with its embedded atom, at the same depth.
+        const bool haloSplit  = data_->haloSplit && useNewtonNL && !multiSite;
+        const bool useSubsets = multiSite || haloSplit;
+        std::vector<char> keepRow;
+        if (haloSplit)
+        {
+            MetatomicTimer       haloTimer("haloSelect", mpiComm_);
+            std::vector<int32_t> anchor(nModel); // a cap's depth is its embedded atom's
+            std::iota(anchor.begin(), anchor.end(), 0);
+            for (const auto& link : links)
+            {
+                anchor[link.row] = link.embedded;
+            }
+            std::vector<std::vector<int32_t>> neighbours(nModel);
+            for (size_t k = 0; k + 1 < pairlistMta_.size(); k += 2)
+            {
+                const int32_t ai = pairlistMta_[k], aj = pairlistMta_[k + 1];
+                if (!links.empty() && (isCapRow[ai] || isCapRow[aj]))
+                {
+                    continue; // the GROMACS pair is for the MM atom, not its cap
+                }
+                neighbours[ai].push_back(aj);
+                neighbours[aj].push_back(ai);
+            }
+            std::vector<int> depth(nModel, -1);
+            std::vector<int32_t> front;
+            for (int32_t row = 0; row < nModel; ++row)
+            {
+                if (homeRow[row] && depth[anchor[row]] < 0)
+                {
+                    depth[anchor[row]] = 0;
+                    front.push_back(anchor[row]);
+                }
+            }
+            for (int hop = 1; hop <= data_->haloHops && !front.empty(); ++hop)
+            {
+                std::vector<int32_t> next;
+                for (const int32_t i : front)
+                {
+                    for (const int32_t j : neighbours[i])
+                    {
+                        if (depth[j] < 0)
+                        {
+                            depth[j] = hop;
+                            next.push_back(j);
+                        }
+                    }
+                }
+                front.swap(next);
+            }
+            keepRow.resize(nModel);
+            for (int32_t row = 0; row < nModel; ++row)
+            {
+                keepRow[row] = homeRow[row] || depth[anchor[row]] >= 0;
+            }
+            if (!haloLogged_)
+            {
+                const auto kept = std::count(keepRow.begin(), keepRow.end(), 1);
+                const auto home = std::count(homeRow.begin(), homeRow.end(), 1);
+                GMX_LOG(logger_.info)
+                        .asParagraph()
+                        .appendTextFormatted(
+                                "Metatomic halo split, rank %d, first step: %ld home + %ld halo of "
+                                "%d model rows",
+                                mpiComm_.rank(),
+                                static_cast<long>(home),
+                                static_cast<long>(kept - home),
+                                nModel);
+                haloLogged_ = true;
+            }
+        }
         if (multiSite && data_->nonConservative)
         {
             GMX_THROW(NotImplementedError(
@@ -1558,7 +1692,21 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         std::vector<int>                  siteOfRow;
         std::vector<int32_t>              localRow;
         std::vector<std::vector<int32_t>> siteRows(multiSite ? numSites : 1);
-        if (multiSite)
+        if (haloSplit)
+        {
+            siteOfRow.assign(nModel, -1);
+            localRow.assign(nModel, -1);
+            for (int32_t row = 0; row < nModel; ++row)
+            {
+                if (keepRow[row])
+                {
+                    siteOfRow[row] = 0;
+                    localRow[row]  = static_cast<int32_t>(siteRows[0].size());
+                    siteRows[0].push_back(row);
+                }
+            }
+        }
+        else if (multiSite)
         {
             siteOfRow.resize(nModel);
             localRow.resize(nModel);
@@ -1599,7 +1747,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         std::vector<std::vector<double>>  sitePositions64(systemRows.size());
         std::vector<std::vector<float>>   sitePositions32(systemRows.size());
         std::vector<metatomic::System>    systems;
-        if (!multiSite)
+        if (!useSubsets)
         {
             systems.push_back(metatomic::System(
                     "nm",
@@ -1673,7 +1821,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             for (size_t s = 0; s < systems.size(); ++s)
             {
                 std::vector<double> systemCharges;
-                if (!multiSite)
+                if (!useSubsets)
                 {
                     systemCharges = charges;
                 }
@@ -1851,22 +1999,22 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 target.add_pairs(request,
                                  metatensor::TensorBlock(std::move(values), samples, components, properties));
             };
-            if (!multiSite)
+            if (!useSubsets)
             {
                 addBlock(systems[0], nlSamplesBuffer_, nlVectorsBuffer_);
             }
             else
             {
-                // pairs within a site only, in the site's row numbering
-                std::vector<std::vector<int32_t>> siteSamples(numSites);
-                std::vector<std::vector<double>>  siteVectors(numSites);
+                // pairs within a site (or the kept rows) only, in its row numbering
+                std::vector<std::vector<int32_t>> siteSamples(siteRows.size());
+                std::vector<std::vector<double>>  siteVectors(siteRows.size());
                 const size_t nPairs = nlVectorsBuffer_.size() / 3;
                 for (size_t k = 0; k < nPairs; ++k)
                 {
                     const int32_t ai = nlSamplesBuffer_[5 * k];
                     const int32_t aj = nlSamplesBuffer_[5 * k + 1];
                     const int     s  = siteOfRow[ai];
-                    if (siteOfRow[aj] != s)
+                    if (s < 0 || siteOfRow[aj] != s)
                     {
                         continue;
                     }
@@ -1885,12 +2033,10 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         }
         buildNLTimer.stop();
 
-        // With domain decomposition, each rank returns its home atoms plus the
-        // caps whose embedded atom is home; a home MM row whose caps all belong
-        // to non-home embedded atoms is left to the rank owning them. With
-        // several sites, each rank returns whole sites instead.
+        // With domain decomposition, each rank returns the rows of homeRow; with several sites,
+        // whole sites instead.
         std::optional<metatensor::Labels> selected;
-        if (!multiSite && useNewtonNL && links.empty())
+        if (!multiSite && useNewtonNL && links.empty() && !haloSplit)
         {
             if (data_->selectedCount != numHomeMta_)
             {
@@ -1910,28 +2056,12 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         }
         else if (!multiSite && useNewtonNL)
         {
-            std::vector<char> keep(nModel, 0);
-            std::fill(keep.begin(), keep.begin() + numHomeMta_, 1);
-            for (const auto& link : links)
-            {
-                if (link.row < numHomeMta_)
-                {
-                    keep[link.row] = 0;
-                }
-            }
-            for (const auto& link : links)
-            {
-                if (link.embedded < numHomeMta_)
-                {
-                    keep[link.row] = 1;
-                }
-            }
             std::vector<int32_t> rows;
             for (int32_t i = 0; i < nModel; ++i)
             {
-                if (keep[i])
+                if (homeRow[i])
                 {
-                    rows.insert(rows.end(), { 0, i });
+                    rows.insert(rows.end(), { 0, haloSplit ? localRow[i] : i });
                 }
             }
             selected = metatensor::Labels(
@@ -2013,13 +2143,13 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             if (modelIsDouble)
             {
                 add_atom_rows<double>(
-                        posGrad, 2, nModel, forceScale, &forces, multiSite ? &systemRows : nullptr);
+                        posGrad, 2, nModel, forceScale, &forces, useSubsets ? &systemRows : nullptr);
                 add_strain<double>(strainGrad, virialMatrix);
             }
             else
             {
                 add_atom_rows<float>(
-                        posGrad, 2, nModel, forceScale, &forces, multiSite ? &systemRows : nullptr);
+                        posGrad, 2, nModel, forceScale, &forces, useSubsets ? &systemRows : nullptr);
                 add_strain<float>(strainGrad, virialMatrix);
             }
         }
