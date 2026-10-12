@@ -1417,13 +1417,13 @@ void MetatomicForceProvider::logSiteAssignment(const std::vector<std::vector<int
 /* Distributed evaluation with domain decomposition (GMX_METATOMIC_DISTRIBUTED).
  *
  * A home atom's energy depends only on atoms within the model's interaction range R. Each rank
- * shares the bounding box of its home ML atoms; every rank then sends it its home atoms, and
- * their periodic images, within R of that box (a rank sends images of its own atoms to itself).
- * The receiver evaluates one non-periodic system of its home atoms and these explicit images,
- * with pairs from a cell list, selecting its home atoms, and returns the forces on the received
- * rows to their owners. With explicit image coordinates the strain gradient of a rank's home
- * energy is its share of the periodic virial, so energies and virials sum over ranks.
+ * shares the bounding box of its home ML atoms; every other rank sends it, once, each of its home
+ * atoms whose nearest periodic image lies within R of that box. The receiver evaluates one
+ * periodic system (the real box) of its home and received atoms, with minimum-image pairs from a
+ * cell list, selecting its home atoms, and returns the forces on the received atoms to their
+ * owners. Energies and virials (the strain gradient of each rank's home energy) sum over ranks.
  * Communication and work per rank scale with its home atoms and their halo, not the whole region.
+ * Needs 2R below the smallest box height, so that each atom is needed in one image only.
  */
 void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput& inputs,
                                                         ForceProviderOutput*      outputs)
@@ -1455,7 +1455,31 @@ void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput
         mpiComm_.sumReduce(bounds.size(), bounds.data());
     }
 
-    // 2. What to send to each rank: home atoms and images within R of its box
+    // 2. What to send to each other rank: home atoms with an image within R of its box
+    const PbcType pbcType = *options_.params_.pbcType_;
+    matrix        boxInv;
+    invertBoxMatrix(inputs.box_, boxInv);
+    // the distance between opposite faces of the box, along each box vector
+    const auto crossNorm = [&](int u, int v)
+    {
+        const auto& p = inputs.box_[u];
+        const auto& q = inputs.box_[v];
+        const double c[3] = { static_cast<double>(p[YY] * q[ZZ] - p[ZZ] * q[YY]),
+                              static_cast<double>(p[ZZ] * q[XX] - p[XX] * q[ZZ]),
+                              static_cast<double>(p[XX] * q[YY] - p[YY] * q[XX]) };
+        return std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    };
+    const double volume = std::abs(static_cast<double>(inputs.box_[XX][XX]) * inputs.box_[YY][YY]
+                                   * inputs.box_[ZZ][ZZ]);
+    const double height[3] = { volume / crossNorm(YY, ZZ), volume / crossNorm(XX, ZZ),
+                               volume / crossNorm(XX, YY) };
+    if (2 * range >= *std::min_element(height, height + 3))
+    {
+        GMX_THROW(InconsistentInputError(formatString(
+                "GMX_METATOMIC_DISTRIBUTED needs the box to be wider than twice the model's "
+                "interaction range (%.3f nm) in every direction.",
+                range)));
+    }
     std::vector<RVec> shifts;
     for (int a = -1; a <= 1; ++a)
     {
@@ -1467,36 +1491,39 @@ void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput
             }
         }
     }
-    const int                         zeroShift = 13; // (0, 0, 0)
     std::vector<std::vector<int32_t>> sendAtom(nRanks);
     std::vector<std::vector<double>>  sendPos(nRanks);
     {
         MetatomicTimer timer("distSelect", mpiComm_);
         for (int dest = 0; dest < nRanks; ++dest)
         {
+            if (dest == rank)
+            {
+                continue;
+            }
             const double* lo = bounds.data() + 6 * dest;
             const double* hi = lo + 3;
-            for (int s = 0; s < static_cast<int>(shifts.size()); ++s)
+            for (int32_t i = 0; i < nHome; ++i)
             {
-                if (dest == rank && s == zeroShift)
-                {
-                    continue; // the home atoms themselves
-                }
-                for (int32_t i = 0; i < nHome; ++i)
+                bool near = false;
+                for (size_t s = 0; s < shifts.size() && !near; ++s)
                 {
                     double d2 = 0.0;
-                    double p[3];
                     for (int d = 0; d < 3; ++d)
                     {
-                        p[d]           = static_cast<double>(positions_[i][d] + shifts[s][d]);
-                        const double g = std::max({ lo[d] - p[d], 0.0, p[d] - hi[d] });
+                        const double p = static_cast<double>(positions_[i][d] + shifts[s][d]);
+                        const double g = std::max({ lo[d] - p, 0.0, p - hi[d] });
                         d2 += g * g;
                     }
-                    if (d2 <= range2)
-                    {
-                        sendAtom[dest].push_back(i);
-                        sendPos[dest].insert(sendPos[dest].end(), { p[0], p[1], p[2] });
-                    }
+                    near = d2 <= range2;
+                }
+                if (near)
+                {
+                    sendAtom[dest].push_back(i);
+                    sendPos[dest].insert(sendPos[dest].end(),
+                                         { static_cast<double>(positions_[i][XX]),
+                                           static_cast<double>(positions_[i][YY]),
+                                           static_cast<double>(positions_[i][ZZ]) });
                 }
             }
         }
@@ -1585,60 +1612,78 @@ void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput
         haloLogged_ = true;
     }
 
-    // 5. Pairs within the largest cutoff, from a cell list over the local rows
+    // 5. Minimum-image pairs within the largest cutoff, from a periodic cell list
     const double maxCutoff = *std::max_element(data_->cutoffNm.begin(), data_->cutoffNm.end());
     std::vector<int32_t> pairI, pairJ;
+    std::vector<IVec>    pairShift;
     std::vector<double>  pairD;
     {
         MetatomicTimer timer("distPairs", mpiComm_);
-        double         lo[3] = { 1e30, 1e30, 1e30 }, hi[3] = { -1e30, -1e30, -1e30 };
-        for (int32_t i = 0; i < nRows; ++i)
-        {
-            for (int d = 0; d < 3; ++d)
-            {
-                lo[d] = std::min(lo[d], x[3 * i + d]);
-                hi[d] = std::max(hi[d], x[3 * i + d]);
-            }
-        }
-        int nc[3];
+        int            nc[3];
         for (int d = 0; d < 3; ++d)
         {
-            nc[d] = std::max(1, static_cast<int>((hi[d] - lo[d]) / maxCutoff));
+            nc[d] = static_cast<int>(height[d] / maxCutoff);
+            if (nc[d] < 3)
+            {
+                GMX_THROW(InconsistentInputError(
+                        "GMX_METATOMIC_DISTRIBUTED needs a box at least three pair cutoffs wide."));
+            }
         }
-        const auto cellOf = [&](int32_t i, int d)
+        std::vector<std::array<int, 3>> cellOf(nRows);
+        for (int32_t i = 0; i < nRows; ++i)
         {
-            return std::min(nc[d] - 1, static_cast<int>((x[3 * i + d] - lo[d]) / maxCutoff));
-        };
+            for (int k = 0; k < 3; ++k)
+            {
+                double f = 0.0; // fractional coordinate along box vector k
+                for (int d = 0; d < 3; ++d)
+                {
+                    f += x[3 * i + d] * static_cast<double>(boxInv[d][k]);
+                }
+                f -= std::floor(f);
+                cellOf[i][k] = std::min(nc[k] - 1, static_cast<int>(f * nc[k]));
+            }
+        }
         const size_t         nCells = static_cast<size_t>(nc[0]) * nc[1] * nc[2];
+        const auto           index  = [&](int a, int b, int c)
+        { return (static_cast<size_t>(a) * nc[1] + b) * nc[2] + c; };
         std::vector<int32_t> head(nCells, -1), next(nRows, -1);
         for (int32_t i = 0; i < nRows; ++i)
         {
-            const size_t c = (static_cast<size_t>(cellOf(i, 0)) * nc[1] + cellOf(i, 1)) * nc[2] + cellOf(i, 2);
+            const size_t c = index(cellOf[i][0], cellOf[i][1], cellOf[i][2]);
             next[i]        = head[c];
             head[c]        = i;
         }
         const double cut2 = maxCutoff * maxCutoff;
         for (int32_t i = 0; i < nRows; ++i)
         {
-            const int ci[3] = { cellOf(i, 0), cellOf(i, 1), cellOf(i, 2) };
-            for (int a = std::max(0, ci[0] - 1); a <= std::min(nc[0] - 1, ci[0] + 1); ++a)
+            for (int a = -1; a <= 1; ++a)
             {
-                for (int b = std::max(0, ci[1] - 1); b <= std::min(nc[1] - 1, ci[1] + 1); ++b)
+                for (int b = -1; b <= 1; ++b)
                 {
-                    for (int c = std::max(0, ci[2] - 1); c <= std::min(nc[2] - 1, ci[2] + 1); ++c)
+                    for (int c = -1; c <= 1; ++c)
                     {
-                        for (int32_t j = head[(static_cast<size_t>(a) * nc[1] + b) * nc[2] + c]; j >= 0; j = next[j])
+                        const size_t cell = index((cellOf[i][0] + a + nc[0]) % nc[0],
+                                                  (cellOf[i][1] + b + nc[1]) % nc[1],
+                                                  (cellOf[i][2] + c + nc[2]) % nc[2]);
+                        for (int32_t j = head[cell]; j >= 0; j = next[j])
                         {
                             if (j <= i)
                             {
                                 continue;
                             }
-                            const double dx = x[3 * j] - x[3 * i], dy = x[3 * j + 1] - x[3 * i + 1],
-                                         dz = x[3 * j + 2] - x[3 * i + 2];
+                            const RVec raw(static_cast<real>(x[3 * j] - x[3 * i]),
+                                           static_cast<real>(x[3 * j + 1] - x[3 * i + 1]),
+                                           static_cast<real>(x[3 * j + 2] - x[3 * i + 2]));
+                            const IVec n     = minimumImageCellShift(boxInv, pbcType, raw);
+                            const RVec shift = cellShiftVector(inputs.box_, n);
+                            const double dx = x[3 * j] - x[3 * i] + shift[XX];
+                            const double dy = x[3 * j + 1] - x[3 * i + 1] + shift[YY];
+                            const double dz = x[3 * j + 2] - x[3 * i + 2] + shift[ZZ];
                             if (dx * dx + dy * dy + dz * dz <= cut2)
                             {
                                 pairI.push_back(i);
                                 pairJ.push_back(j);
+                                pairShift.push_back(n);
                                 pairD.insert(pairD.end(), { dx, dy, dz });
                             }
                         }
@@ -1648,7 +1693,7 @@ void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput
         }
     }
 
-    // 6. One non-periodic system of the local rows, home atoms selected
+    // 6. One periodic system of the local rows, home atoms selected
     const bool       modelIsDouble = data_->useFloat64;
     const DLDataType floatType     = modelIsDouble ? DLDataType{ kDLFloat, 64, 1 } : DLDataType{ kDLFloat, 32, 1 };
     std::vector<float> x32;
@@ -1658,17 +1703,24 @@ void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput
         x32.assign(x.begin(), x.end());
         positionData = x32.data();
     }
-    std::array<double, 9>  cell64{};
-    std::array<float, 9>   cell32{};
-    std::array<uint8_t, 3> noPbc = { 0, 0, 0 };
-    metatomic::System      system("nm",
+    std::array<double, 9> cell64{};
+    std::array<float, 9>  cell32{};
+    for (int a = 0; a < 3; ++a)
+    {
+        for (int b = 0; b < 3; ++b)
+        {
+            cell64[3 * a + b] = static_cast<double>(inputs.box_[a][b]);
+            cell32[3 * a + b] = static_cast<float>(inputs.box_[a][b]);
+        }
+    }
+    metatomic::System system("nm",
                              wrap_dlpack(types.data(), { nRows }, { kDLInt, 32, 1 }),
                              wrap_dlpack(positionData, { nRows, 3 }, floatType),
                              wrap_dlpack(modelIsDouble ? static_cast<void*>(cell64.data())
                                                        : static_cast<void*>(cell32.data()),
                                          { 3, 3 },
                                          floatType),
-                             wrap_dlpack(noPbc.data(), { 3 }, { kDLBool, 8, 1 }));
+                             wrap_dlpack(data_->pbc.data(), { 3 }, { kDLBool, 8, 1 }));
     for (const auto& input : data_->chargeInputs)
     {
         const double toUnit =
@@ -1715,11 +1767,12 @@ void MetatomicForceProvider::calculateForcesDistributed(const ForceProviderInput
             {
                 continue;
             }
-            samples.insert(samples.end(), { pairI[k], pairJ[k], 0, 0, 0 });
+            const IVec& n = pairShift[k];
+            samples.insert(samples.end(), { pairI[k], pairJ[k], n[XX], n[YY], n[ZZ] });
             vectors.insert(vectors.end(), { d[0], d[1], d[2] });
             if (request.full_list())
             {
-                samples.insert(samples.end(), { pairJ[k], pairI[k], 0, 0, 0 });
+                samples.insert(samples.end(), { pairJ[k], pairI[k], -n[XX], -n[YY], -n[ZZ] });
                 vectors.insert(vectors.end(), { -d[0], -d[1], -d[2] });
             }
         }
