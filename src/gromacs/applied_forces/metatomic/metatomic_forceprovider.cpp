@@ -1668,19 +1668,26 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             {
                 keepRow[row] = homeRow[row] || depth[anchor[row]] >= 0;
             }
-            if (!haloLogged_)
+            if (!haloLogged_) // the same step on every rank, so the reduction is collective
             {
-                const auto kept = std::count(keepRow.begin(), keepRow.end(), 1);
-                const auto home = std::count(homeRow.begin(), homeRow.end(), 1);
+                std::vector<int> counts(2 * mpiComm_.size(), 0);
+                counts[2 * mpiComm_.rank()] =
+                        static_cast<int>(std::count(homeRow.begin(), homeRow.end(), 1));
+                counts[2 * mpiComm_.rank() + 1] =
+                        static_cast<int>(std::count(keepRow.begin(), keepRow.end(), 1))
+                        - counts[2 * mpiComm_.rank()];
+                mpiComm_.sumReduce(ArrayRef<int>(counts));
+                std::vector<std::string> perRank;
+                for (int r = 0; r < mpiComm_.size(); ++r)
+                {
+                    perRank.push_back(formatString("rank %d %d + %d", r, counts[2 * r], counts[2 * r + 1]));
+                }
                 GMX_LOG(logger_.info)
                         .asParagraph()
-                        .appendTextFormatted(
-                                "Metatomic halo split, rank %d, first step: %ld home + %ld halo of "
-                                "%d model rows",
-                                mpiComm_.rank(),
-                                static_cast<long>(home),
-                                static_cast<long>(kept - home),
-                                nModel);
+                        .appendTextFormatted("Metatomic halo split, first step, home + halo of %d "
+                                             "model rows: %s",
+                                             nModel,
+                                             joinStrings(perRank, "; ").c_str());
                 haloLogged_ = true;
             }
         }
