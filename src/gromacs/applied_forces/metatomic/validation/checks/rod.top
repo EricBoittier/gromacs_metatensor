@@ -1,0 +1,41 @@
+; A 6-atom Metatomic rod (1.3 nm, wider than rcoulomb) and four MM ions.
+[ defaults ]
+; nbfunc  comb-rule  gen-pairs  fudgeLJ  fudgeQQ
+  1       2          no         1.0      1.0
+
+[ atomtypes ]
+; name  at.num  mass     charge  ptype  sigma  epsilon
+  CT    6       12.011   0.0     A      0.30   0.0
+  OT    8       15.999   0.0     A      0.30   0.0
+
+[ moleculetype ]
+rod  0
+
+[ atoms ]
+;  nr  type  resnr  res  atom  cgnr  charge   mass
+   1   CT    1      ROD  C0    1      0.40    12.011
+   2   OT    1      ROD  O1    2     -0.30    15.999
+   3   CT    1      ROD  C2    3      0.35    12.011
+   4   OT    1      ROD  O3    4     -0.45    15.999
+   5   CT    1      ROD  C4    5      0.30    12.011
+   6   OT    1      ROD  O5    6     -0.30    15.999
+
+[ moleculetype ]
+ion  0
+
+[ atoms ]
+   1   CT    1      ION  C     1      0.50    12.011
+
+[ moleculetype ]
+anion  0
+
+[ atoms ]
+   1   OT    1      ANI  O     1     -0.50    15.999
+
+[ system ]
+Metatomic region wider than rcoulomb
+
+[ molecules ]
+rod    1
+ion    2
+anion  2

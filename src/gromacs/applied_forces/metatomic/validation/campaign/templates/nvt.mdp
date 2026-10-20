@@ -1,0 +1,22 @@
+; MM-only heating, 50 ps, peptide heavy atoms restrained
+define                  = -DPOSRES
+integrator              = md
+dt                      = 0.002
+nsteps                  = 25000
+constraints             = h-bonds
+cutoff-scheme           = Verlet
+pbc                     = xyz
+coulombtype             = PME
+rcoulomb                = 1.0
+vdwtype                 = Cut-off
+rvdw                    = 1.0
+DispCorr                = EnerPres
+tcoupl                  = V-rescale
+tc-grps                 = System
+tau-t                   = 0.1
+ref-t                   = 300
+gen-vel                 = yes
+gen-temp                = 300
+gen-seed                = 2026
+nstenergy               = 500
+nstlog                  = 5000

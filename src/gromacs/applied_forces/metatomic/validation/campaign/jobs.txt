@@ -1,0 +1,22 @@
+# name            box_nm  ml_region  seed
+# ML region: "peptide" (87 atoms) or "shell" (peptide + whole waters with any atom
+# within 0.5 nm of it after MM heating; the set is fixed for the run).
+# Ordered so the first pass covers every box and ML region before the repeats.
+box5_peptide_s1   5.0     peptide    1
+box5_shell_s1     5.0     shell      1
+box4_peptide_s1   4.0     peptide    1
+box6_peptide_s1   6.0     peptide    1
+box4_shell_s1     4.0     shell      1
+box6_shell_s1     6.0     shell      1
+box5_peptide_s2   5.0     peptide    2
+box5_shell_s2     5.0     shell      2
+box4_peptide_s2   4.0     peptide    2
+box6_peptide_s2   6.0     peptide    2
+box4_shell_s2     4.0     shell      2
+box6_shell_s2     6.0     shell      2
+box5_peptide_s3   5.0     peptide    3
+box5_shell_s3     5.0     shell      3
+box4_peptide_s3   4.0     peptide    3
+box6_peptide_s3   6.0     peptide    3
+box4_shell_s3     4.0     shell      3
+box6_shell_s3     6.0     shell      3

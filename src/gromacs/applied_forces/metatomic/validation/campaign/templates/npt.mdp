@@ -1,0 +1,36 @@
+; Short NpT with ONIOM (PET-MAD peptide in TIP3P), 20 ps
+integrator              = md
+dt                      = 0.0005
+nsteps                  = 40000
+constraints             = none          ; peptide is ML; waters stay rigid via SETTLE
+cutoff-scheme           = Verlet
+pbc                     = xyz
+coulombtype             = PME
+rcoulomb                = 1.0
+vdwtype                 = Cut-off
+rvdw                    = 1.0
+DispCorr                = EnerPres
+; PET-MAD interaction range is 1.5 nm: fixed pairlist reaching past it
+verlet-buffer-tolerance = -1
+rlist                   = 1.55
+nstlist                 = 20
+tcoupl                  = V-rescale
+tc-grps                 = System
+tau-t                   = 0.1
+ref-t                   = 300
+pcoupl                  = C-rescale
+pcoupltype              = isotropic
+tau-p                   = 2.0
+ref-p                   = 1.0
+compressibility         = 4.5e-5
+continuation            = yes
+nstcalcenergy           = 10
+nstenergy               = 100
+nstlog                  = 2000
+nstxout-compressed      = 2000
+; ONIOM: E = E_MM(full) + E_PET-MAD(peptide) - E_MM(peptide)
+metatomic-active        = yes
+metatomic-model         = /home/boittier/metawork/openmm-metatomic/models/pet-mad-xs-v1.5.0.pt
+metatomic-input-group   = ML
+metatomic-device        = cuda
+metatomic-oniom         = yes
