@@ -73,9 +73,31 @@ analytic model loaded as a C-API plugin.
 
 ## Pinning
 
-Upstream moves, so record the revision you built against rather than tracking
-the branch tip. At the time of writing, `metatensor/metatomic` branch
-`metatomic-core` is at `e9f59e7`. Related upstream work:
+Build against **`metatensor/metatomic` @ `a245aed8`** ("Allow loading the same
+plugin multiple time", 19 Oct 2026) with **metatensor-core 0.2.4**. Verified:
+that pair configures and builds this module, and the 39 tests in
+`mta_applied_forces-test` pass.
+
+Do not track the branch tip. The very next commit, `0ca705ae` "Requested
+inputs and pair list can depend on which outputs will be computed" (also 19
+Oct), gives `requested_pair_lists()` and `requested_inputs()` a
+`const std::vector<Quantity>&` parameter:
+
+```
+error: no matching function for call to 'metatomic::ExternalModel::requested_pair_lists()'
+  candidate: 'virtual std::vector<PairListOptions>
+      metatomic::ExternalModel::requested_pair_lists(const std::vector<Quantity>&) const'
+  candidate expects 1 argument, 0 provided
+```
+
+Three call sites break: `metatomic_mdmodule.cpp:247` and
+`metatomic_forceprovider.cpp:488`, `:637`. Adapting to it means deciding which
+outputs to declare at each call, so it is a change with a judgement in it, not
+a mechanical fix.
+
+This is the reason the build prints the versions it found: the dependency is a
+branch, and it moved under this module seven days after the module was
+written. Related upstream work:
 [#359](https://github.com/metatensor/metatomic/pull/359) rebuilds
 metatomic-torch on top of metatomic-core, so the C core is the direction of
 travel rather than a side branch.
