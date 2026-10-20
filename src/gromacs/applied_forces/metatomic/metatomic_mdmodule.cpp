@@ -55,6 +55,7 @@
 #include "gromacs/utility/exceptions.h"
 #include "gromacs/utility/keyvaluetreebuilder.h"
 #include "gromacs/utility/logger.h"
+#include "gromacs/utility/stringutil.h"
 
 #include "embedded_coulomb_correction.h"
 #include "metatomic_forceprovider.h"
@@ -114,6 +115,11 @@ public:
 
         const auto modifyTopologyFunction = [this](gmx_mtop_t* top) { options_.modifyTopology(top); };
         notifiers->preProcessingNotifier_.subscribe(modifyTopologyFunction);
+
+        // Exclusions between embedded atoms are corrected at any distance with ONIOM
+        const auto exemptExclusionsFunction = [this](ExclusionDistanceExemptions* exemptions)
+        { options_.addExclusionDistanceExemptions(exemptions); };
+        notifiers->preProcessingNotifier_.subscribe(exemptExclusionsFunction);
 
         const auto writeParamsToKvtFunction = [this](KeyValueTreeObjectBuilder kvt)
         { options_.writeParamsToKvt(kvt); };
@@ -343,15 +349,24 @@ public:
                 charges.push_back(atom.q);
                 groups.push_back(params.energyGroups_[i]);
             }
+            // With several sites only pairs within a site are corrected, matching the exclusions
+            std::vector<int> sites;
+            if (params.numSites() > 1)
+            {
+                sites = params.mtaSites_;
+            }
             embeddedCoulomb_ = std::make_unique<EmbeddedCoulombCorrectionProvider>(
-                    *params.mtaAtoms_, charges, groups, params.numEnergyGroups_, *params.pbcType_, options_.mpiComm());
+                    *params.mtaAtoms_, charges, groups, params.numEnergyGroups_, *params.pbcType_, options_.mpiComm(), sites);
             forceProviders->addForceProvider(embeddedCoulomb_.get(), "Metatomic embedded Coulomb");
             GMX_LOG(options_.logger().info)
                     .asParagraph()
                     .appendTextFormatted(
                             "Metatomic ONIOM: removing the classical Coulomb interaction between "
-                            "all %zu embedded atoms, including pairs beyond rcoulomb.",
-                            params.mtaIndices_.size());
+                            "the %zu embedded atoms%s, including pairs beyond rcoulomb.",
+                            params.mtaIndices_.size(),
+                            params.numSites() > 1
+                                    ? formatString(" within each of %d sites", params.numSites()).c_str()
+                                    : "");
         }
     }
 
