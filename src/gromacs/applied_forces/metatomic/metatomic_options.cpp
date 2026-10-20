@@ -536,7 +536,11 @@ void MetatomicOptions::setInputGroupIndices(const IndexGroupsAndNames& indexGrou
         }
         else if (out.size() == 1)
         {
-            out.assign(numSites, out[0]);
+            // The value has to be copied out first: assign() gives no aliasing
+            // guarantee, and libc++ frees the old buffer before reading its
+            // argument, so out[0] would dangle (libstdc++ and MSVC copy first).
+            const T value = out[0];
+            out.assign(numSites, value);
         }
         else if (static_cast<int>(out.size()) != numSites)
         {
