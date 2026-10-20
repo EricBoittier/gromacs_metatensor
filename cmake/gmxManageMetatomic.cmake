@@ -51,11 +51,22 @@ if(NOT GMX_METATOMIC STREQUAL "OFF")
     # requires 0.2.4 (REQUIRED_METATENSOR_VERSION), so match that floor.
     find_package(metatensor 0.2.4 CONFIG QUIET)
     if(metatensor_FOUND)
+        # Deliberately no version floor. metatomic-core is unreleased
+        # (metatensor/metatomic#232), and its config file pairs
+        # SameMinorVersion compatibility with a version that create_development_
+        # version() derives by bumping the minor: a source build of the 0.1.0
+        # tree reports 0.2.0-dev, so any floor we could write here rejects
+        # either every dev build or every release. The STATUS line below
+        # records what was actually found instead.
+        # See src/gromacs/applied_forces/metatomic/docs/dependencies.md.
         find_package(metatomic CONFIG QUIET)
     endif()
     if(metatomic_FOUND)
         set(GMX_METATOMIC_ACTIVE ON)
-        message(STATUS "Found metatomic: Metatomic potential support enabled.")
+        # Record the versions: while metatomic-core is unreleased, the build log
+        # is the only place the revision in use is written down.
+        message(STATUS "Found metatomic ${metatomic_VERSION} (metatensor ${metatensor_VERSION}): "
+                       "Metatomic potential support enabled.")
 
         list(APPEND GMX_COMMON_LIBRARIES metatomic::shared)
 
@@ -83,9 +94,11 @@ if(NOT GMX_METATOMIC STREQUAL "OFF")
         list(REMOVE_DUPLICATES CMAKE_INSTALL_RPATH)
     elseif(GMX_METATOMIC STREQUAL "TORCH")
         message(FATAL_ERROR
-            "metatomic was not found. Install libmetatomic and add the "
-            "directories containing metatomic-config.cmake and "
-            "metatensor-config.cmake to CMAKE_PREFIX_PATH.")
+            "metatomic with metatensor >= 0.2.4 was not found. Install "
+            "libmetatomic and add the directories containing "
+            "metatomic-config.cmake and metatensor-config.cmake to "
+            "CMAKE_PREFIX_PATH. Building metatomic-core is described in "
+            "src/gromacs/applied_forces/metatomic/docs/dependencies.md.")
     else() # AUTO
         message(STATUS "metatomic not found. Metatomic potential support will be disabled.")
     endif()
