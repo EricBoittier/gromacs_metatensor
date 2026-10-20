@@ -27,6 +27,7 @@
 #include <metatomic.hpp>
 #include <numeric>
 #include <string>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -41,7 +42,7 @@ public:
 
     metatomic::ModelCapabilities capabilities() const override
     {
-        std::vector<int64_t> types;
+        std::vector<int> types;
         for (int64_t z = 1; z <= 118; ++z)
         {
             types.push_back(z);
@@ -97,7 +98,7 @@ public:
     }
 
     std::vector<metatensor::TensorMap> execute_inner(const std::vector<metatomic::System>& systems,
-                                                     const metatensor::Labels* selected,
+                                                     std::optional<metatensor::Labels> selected,
                                                      const std::vector<metatomic::Quantity>& /*outputs*/) override
     {
         // one energy block for all systems: a row per system, or per selected atom
@@ -155,7 +156,7 @@ public:
             {
                 systemRow = newRow({ sys });
             }
-            else if (selected != nullptr)
+            else if (selected.has_value())
             {
                 const auto values = selected->values_cpu();
                 for (size_t k = 0; k < selected->count(); ++k)
