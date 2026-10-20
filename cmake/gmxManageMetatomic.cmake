@@ -35,8 +35,18 @@
 gmx_option_multichoice(GMX_METATOMIC
   "Enable interface to metatomic atomistic models"
     AUTO
-    AUTO TORCH OFF
+    AUTO ON TORCH OFF
 )
+
+# TORCH was the name for "required" while the interface went through libtorch.
+# It does not any more, so the value is ON. The old spelling keeps working:
+# existing CI jobs and pixi tasks pass -DGMX_METATOMIC=TORCH.
+if(GMX_METATOMIC STREQUAL "TORCH")
+    message(STATUS
+        "GMX_METATOMIC=TORCH is deprecated and now means ON; the metatomic "
+        "interface uses the metatomic C API, not libtorch.")
+    set(GMX_METATOMIC "ON")
+endif()
 
 # The C API does not use libtorch. Leave GMX_TORCH to NNPot.
 set(GMX_METATOMIC_ACTIVE OFF)
@@ -92,7 +102,7 @@ if(NOT GMX_METATOMIC STREQUAL "OFF")
             endif()
         endforeach()
         list(REMOVE_DUPLICATES CMAKE_INSTALL_RPATH)
-    elseif(GMX_METATOMIC STREQUAL "TORCH")
+    elseif(GMX_METATOMIC STREQUAL "ON")
         message(FATAL_ERROR
             "metatomic with metatensor >= 0.2.4 was not found. Install "
             "libmetatomic and add the directories containing "

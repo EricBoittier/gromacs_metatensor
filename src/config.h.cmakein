@@ -483,7 +483,7 @@
 #cmakedefine01 GMX_METATOMIC
 
 /* Define if the metatomic C API force provider is compiled in.
- * GMX_METATOMIC is the AUTO/TORCH/OFF option string; this flag is 1 only
+ * GMX_METATOMIC is the AUTO/ON/OFF option string; this flag is 1 only
  * when libmetatomic was found. */
 #cmakedefine01 GMX_METATOMIC_ACTIVE
 
