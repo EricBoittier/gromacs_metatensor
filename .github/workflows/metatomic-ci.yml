@@ -8,7 +8,12 @@ on:
         required: false
         default: "main"
   push:
-    branches: [metatomic]
+    branches:
+      - metatomic
+      # The C API and ONIOM work lands on long-lived topic branches; without
+      # these the integration matrix only ran once a pull request was open.
+      - 'oniom-**'
+      - 'capi/**'
   pull_request:
 
 jobs:
