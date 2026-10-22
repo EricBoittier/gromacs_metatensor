@@ -55,6 +55,7 @@
 #ifndef GMX_APPLIED_FORCES_METATOMIC_EMBEDDED_COULOMB_CORRECTION_H
 #define GMX_APPLIED_FORCES_METATOMIC_EMBEDDED_COULOMB_CORRECTION_H
 
+#include <memory>
 #include <vector>
 
 #include "gromacs/domdec/localatomset.h"
@@ -71,6 +72,7 @@ namespace gmx
 {
 
 class MpiComm;
+class EmbeddedCoulombCorrectionGpu;
 
 //! Energy, forces and virial of the embedded Coulomb correction.
 struct EmbeddedCoulombCorrection
@@ -118,6 +120,10 @@ EmbeddedCoulombCorrection computeEmbeddedCoulombCorrection(ArrayRef<const RVec> 
  * each rank evaluates all pairs and applies forces to its home atoms, and the
  * main rank adds the energy and virial. The energy goes to the Coulomb (SR)
  * term, next to the in-cut-off exclusion corrections of the kernels.
+ *
+ * In CUDA builds the pairs are evaluated on the GPU (embedded_coulomb_correction_gpu.h),
+ * unless GMX_METATOMIC_ECC_CPU is set; GMX_METATOMIC_ECC_CHECK also runs the CPU loop on
+ * the first step and reports the difference.
  */
 class EmbeddedCoulombCorrectionProvider final : public IForceProvider
 {
@@ -137,6 +143,7 @@ public:
                                       PbcType             pbcType,
                                       const MpiComm&      mpiComm,
                                       std::vector<int>    sites = {});
+    ~EmbeddedCoulombCorrectionProvider();
 
     void calculateForces(const ForceProviderInput& input, ForceProviderOutput* output) override;
 
@@ -150,6 +157,9 @@ private:
     const MpiComm&    mpiComm_;
     //! Position of every embedded atom, summed over ranks.
     std::vector<double> positions_;
+    //! GPU evaluation, created on the first step (when the device is set) in CUDA builds
+    std::unique_ptr<EmbeddedCoulombCorrectionGpu> gpu_;
+    bool                                          firstStep_ = true;
 };
 
 } // namespace gmx
