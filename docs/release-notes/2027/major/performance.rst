@@ -17,3 +17,12 @@ all three dimensions are considered when estimating atom density.
 
 :issue:`5622`
 
+
+The plain pairlist of an ML region only holds pairs of its atoms
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+When every module requesting a plain pairlist (the Metatomic interface does)
+gives the atoms it needs, the list is built only for pairs of those atoms,
+instead of for every pair of the system within range. For a pair model on an
+87-atom peptide in 21,084 atoms of water this cut the plain pairlist from
+4.5 to 0.03 ms per step.

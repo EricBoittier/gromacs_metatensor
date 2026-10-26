@@ -178,7 +178,9 @@ public:
         const auto setPlainPairlistRangeFunction = [this](PlainPairlistRanges* ranges)
         {
             createForceProvider();
-            ranges->addRange(force_provider_->plainPairlistRange(*ranges));
+            // The model only uses pairs between its own atoms
+            ranges->addRange(force_provider_->plainPairlistRange(*ranges),
+                             options_.parameters().mtaIndices_);
         };
         notifiers->simulationSetupNotifier_.subscribe(setPlainPairlistRangeFunction);
 #endif // GMX_METATOMIC_ACTIVE

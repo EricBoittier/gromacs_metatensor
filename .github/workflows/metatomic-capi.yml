@@ -23,7 +23,7 @@ env:
   METATENSOR_CORE_VERSION: 0.2.6
   GMX_TESTS: >-
     mta_applied_forces-test mdrunutility-test nbnxm-test topology-test
-    nnpot_applied_forces-test qmmm_applied_forces-test
+    nnpot_applied_forces-test qmmm_applied_forces-test gmxpreprocess-test
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   NINJA_STATUS: "[%f/%t %o/sec] "
 
