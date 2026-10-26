@@ -173,91 +173,100 @@ public:
                                                      std::optional<metatensor::Labels> selectedAtoms,
                                                      const std::vector<metatomic::Quantity>& /*requestedOutputs*/) override
     {
-        if (systems.size() != 1 || selectedAtoms.has_value())
+        if (selectedAtoms.has_value())
         {
-            throw metatomic::Error("the test model takes one system and no atom selection");
+            throw metatomic::Error("the test model takes no atom selection");
         }
-        const auto& system  = systems[0];
-        const auto  nAtoms  = system.size();
-        auto        pairs   = system.pairs(pairs_);
-        const auto  samples = pairs.samples().values_cpu();
-        const auto  vectors = pairs.values<double>();
-
         const double sigma   = c_sigma * toLength_;
         const double epsilon = c_epsilon * toEnergy_;
         const double cutoff  = c_cutoff * toLength_;
 
-        double                         energy = 0;
-        std::vector<double>            positionsGradient(3 * nAtoms, 0.0);
-        std::array<double, 9>          strainGradient{};
-        if (input_ == "charge")
+        // one energy per system; gradient rows (sample = system, system, atom) and one
+        // strain row per system
+        std::vector<double>  energies(systems.size(), 0.0);
+        std::vector<double>  positionsGradient;
+        std::vector<int32_t> gradientSamples;
+        std::vector<double>  strainGradient(9 * systems.size(), 0.0);
+        std::vector<int32_t> systemSamples;
+        for (size_t sys = 0; sys < systems.size(); ++sys)
         {
-            auto chargeMap = system.custom_data("charge");
-            auto block     = chargeMap.block_by_id(0);
-            auto charges   = block.values<double>();
+            const auto& system = systems[sys];
+            const auto  nAtoms = system.size();
+            const auto  offset = positionsGradient.size() / 3;
+            positionsGradient.resize(positionsGradient.size() + 3 * nAtoms, 0.0);
             for (size_t atom = 0; atom < nAtoms; ++atom)
             {
-                energy += toEnergy_ * charges(atom, 0);
+                const auto i32 = static_cast<int32_t>(sys);
+                gradientSamples.insert(gradientSamples.end(), { i32, i32, static_cast<int32_t>(atom) });
             }
-        }
-        for (size_t pair = 0; pair < pairs.samples().count(); ++pair)
-        {
-            const double d[3] = { vectors(pair, 0, 0), vectors(pair, 1, 0), vectors(pair, 2, 0) };
-            const double r    = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-            if (r >= cutoff)
+            systemSamples.push_back(static_cast<int32_t>(sys));
+            double& energy = energies[sys];
+            if (input_ == "charge")
             {
-                continue;
-            }
-            const double sr6  = std::pow(sigma / r, 6);
-            const double k    = c_springConstant * toEnergy_ / (toLength_ * toLength_);
-            const double r0   = c_restLength * toLength_;
-            const double dEdr = harmonic_ ? 2 * k * (r - r0) : 4 * epsilon * (-12 * sr6 * sr6 + 6 * sr6) / r;
-            energy += harmonic_ ? k * (r - r0) * (r - r0) : 4 * epsilon * (sr6 * sr6 - sr6);
-            const auto   i    = static_cast<size_t>(samples(pair, 0));
-            const auto   j    = static_cast<size_t>(samples(pair, 1));
-            for (int a = 0; a < 3; ++a)
-            {
-                // d = x_j - x_i + shift
-                positionsGradient[3 * j + a] += dEdr * d[a] / r;
-                positionsGradient[3 * i + a] -= dEdr * d[a] / r;
-                for (int b = 0; b < 3; ++b)
+                auto chargeMap = system.custom_data("charge");
+                auto block     = chargeMap.block_by_id(0);
+                auto charges   = block.values<double>();
+                for (size_t atom = 0; atom < nAtoms; ++atom)
                 {
-                    strainGradient[3 * a + b] += d[a] * dEdr * d[b] / r;
+                    energy += toEnergy_ * charges(atom, 0);
+                }
+            }
+            auto       pairs   = system.pairs(pairs_);
+            const auto samples = pairs.samples().values_cpu();
+            const auto vectors = pairs.values<double>();
+            for (size_t pair = 0; pair < pairs.samples().count(); ++pair)
+            {
+                const double d[3] = { vectors(pair, 0, 0), vectors(pair, 1, 0), vectors(pair, 2, 0) };
+                const double r    = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (r >= cutoff)
+                {
+                    continue;
+                }
+                const double sr6  = std::pow(sigma / r, 6);
+                const double k    = c_springConstant * toEnergy_ / (toLength_ * toLength_);
+                const double r0   = c_restLength * toLength_;
+                const double dEdr = harmonic_ ? 2 * k * (r - r0) : 4 * epsilon * (-12 * sr6 * sr6 + 6 * sr6) / r;
+                energy += harmonic_ ? k * (r - r0) * (r - r0) : 4 * epsilon * (sr6 * sr6 - sr6);
+                const auto i = offset + static_cast<size_t>(samples(pair, 0));
+                const auto j = offset + static_cast<size_t>(samples(pair, 1));
+                for (int a = 0; a < 3; ++a)
+                {
+                    // d = x_j - x_i + shift
+                    positionsGradient[3 * j + a] += dEdr * d[a] / r;
+                    positionsGradient[3 * i + a] -= dEdr * d[a] / r;
+                    for (int b = 0; b < 3; ++b)
+                    {
+                        strainGradient[9 * sys + 3 * a + b] += d[a] * dEdr * d[b] / r;
+                    }
                 }
             }
         }
 
-        auto block = metatensor::TensorBlock(
-                std::make_unique<metatensor::SimpleDataArray<double>>(std::vector<uintptr_t>{ 1, 1 },
-                                                                      std::vector<double>{ energy }),
-                metatensor::Labels({ "system" }, { { 0 } }),
+        const auto nSystems  = systems.size();
+        const auto nGradient = positionsGradient.size() / 3;
+        auto       block     = metatensor::TensorBlock(
+                std::make_unique<metatensor::SimpleDataArray<double>>(std::vector<uintptr_t>{ nSystems, 1 },
+                                                                      energies),
+                metatensor::Labels({ "system" }, systemSamples.data(), nSystems),
                 {},
                 metatensor::Labels({ "energy" }, { { 0 } }));
-
-        std::vector<int32_t> gradientSamples;
-        for (size_t atom = 0; atom < nAtoms; ++atom)
-        {
-            gradientSamples.insert(gradientSamples.end(), { 0, 0, static_cast<int32_t>(atom) });
-        }
         block.add_gradient(
                 "positions",
                 metatensor::TensorBlock(std::make_unique<metatensor::SimpleDataArray<double>>(
-                                                std::vector<uintptr_t>{ nAtoms, 3, 1 }, positionsGradient),
+                                                std::vector<uintptr_t>{ nGradient, 3, 1 }, positionsGradient),
                                         metatensor::Labels({ "sample", "system", "atom" },
                                                            gradientSamples.data(),
-                                                           nAtoms),
+                                                           nGradient),
                                         { metatensor::Labels({ "xyz" }, { { 0 }, { 1 }, { 2 } }) },
                                         metatensor::Labels({ "energy" }, { { 0 } })));
         block.add_gradient(
                 "strain",
-                metatensor::TensorBlock(
-                        std::make_unique<metatensor::SimpleDataArray<double>>(
-                                std::vector<uintptr_t>{ 1, 3, 3, 1 },
-                                std::vector<double>(strainGradient.begin(), strainGradient.end())),
-                        metatensor::Labels({ "sample" }, { { 0 } }),
-                        { metatensor::Labels({ "xyz_1" }, { { 0 }, { 1 }, { 2 } }),
-                          metatensor::Labels({ "xyz_2" }, { { 0 }, { 1 }, { 2 } }) },
-                        metatensor::Labels({ "energy" }, { { 0 } })));
+                metatensor::TensorBlock(std::make_unique<metatensor::SimpleDataArray<double>>(
+                                                std::vector<uintptr_t>{ nSystems, 3, 3, 1 }, strainGradient),
+                                        metatensor::Labels({ "sample" }, systemSamples.data(), nSystems),
+                                        { metatensor::Labels({ "xyz_1" }, { { 0 }, { 1 }, { 2 } }),
+                                          metatensor::Labels({ "xyz_2" }, { { 0 }, { 1 }, { 2 } }) },
+                                        metatensor::Labels({ "energy" }, { { 0 } })));
 
         std::vector<metatensor::TensorBlock> blocks;
         blocks.push_back(std::move(block));
@@ -604,6 +613,67 @@ TEST_F(MetatomicLinkCapTest, VirialIsHalfTheStrainDerivative)
             EXPECT_NEAR(0.5 * derivative, virial[b][a], c_fdTolerance) << "virial " << b << ", " << a;
         }
     }
+}
+
+TEST(MetatomicSitesTest, SitesAreSeparateSystems)
+{
+    registerTestPlugin();
+    // two sites of two atoms; atoms 1 and 2 are close, but in different sites
+    MetatomicOptions options;
+    auto&            params = options.params_;
+    init_t_atoms(&params.atoms_, 4, false);
+    for (int i = 0; i < 4; ++i)
+    {
+        params.atoms_.atom[i].atomnumber = c_atomicNumber;
+    }
+    LocalAtomSetManager atomSets;
+    params.active            = true;
+    params.modelPath_        = "gromacs-test-pair-model";
+    params.modelOptions      = R"({"length_unit": "Angstrom", "energy_unit": "eV"})";
+    params.mtaIndices_       = { 0, 1, 2, 3 };
+    params.numAtoms_         = 4;
+    params.mtaAtoms_         = std::make_unique<LocalAtomSet>(atomSets.add(ArrayRef<const Index>(params.mtaIndices_)));
+    params.pbcType_          = std::make_unique<PbcType>(PbcType::Xyz);
+    params.siteGroups        = "A B";
+    params.mtaSites_         = { 0, 0, 1, 1 };
+    params.siteChargeValues_ = { 0, 0 };
+    params.siteSpinValues_   = { 1, 1 };
+
+    const MpiComm           mpiComm(MpiComm::SingleRank{});
+    MDLogger                logger;
+    const std::vector<RVec> x = { RVec(1.0, 1.0, 1.0), RVec(1.36, 1.0, 1.0), RVec(1.74, 1.0, 1.0), RVec(2.12, 1.05, 1.0) };
+    MetatomicForceProvider  provider(options, logger, mpiComm);
+    provider.gatherAtomNumbersIndices(MDModulesAtomsRedistributedSignal(c_cubicBox, x, {}, {}, std::nullopt));
+    std::vector<MDModulesPairlistConstructedSignal::PairlistEntry> pairlist;
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = i + 1; j < 4; ++j)
+        {
+            pairlist.push_back({ { i, j }, xyzToShiftIndex(0, 0, 0) });
+        }
+    }
+    provider.setPairlist(MDModulesPairlistConstructedSignal(pairlist, {}, {}));
+
+    std::vector<RVec>   forces(4, RVec(0, 0, 0));
+    ForceWithVirial     forceWithVirial(forces, true);
+    gmx_enerdata_t      enerd(1, nullptr);
+    ForceProviderOutput output(&forceWithVirial, &enerd);
+    provider.calculateForces(ForceProviderInput(x, 4, {}, {}, 0.0, 0, c_cubicBox, mpiComm, nullptr), &output);
+
+    const auto lj = [](const RVec& a, const RVec& b)
+    {
+        const double sr6 = std::pow(c_sigma / (b.toDVec() - a.toDVec()).norm(), 6);
+        return 4 * c_epsilon * (sr6 * sr6 - sr6);
+    };
+    const double expected = lj(x[0], x[1]) + lj(x[2], x[3]);
+    EXPECT_NEAR(expected, enerd.term[InteractionFunction::MetatomicPotentialEnergy], c_tolerance * std::abs(expected));
+    // atoms 1 and 2 only feel their own site: equal and opposite forces within each site
+    for (int d = 0; d < 3; ++d)
+    {
+        EXPECT_NEAR(forces[0][d], -forces[1][d], 1e-3);
+        EXPECT_NEAR(forces[2][d], -forces[3][d], 1e-3);
+    }
+    done_atom(&params.atoms_);
 }
 
 #else

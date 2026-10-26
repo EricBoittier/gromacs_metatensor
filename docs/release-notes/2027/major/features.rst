@@ -51,3 +51,13 @@ electrostatics. :mdp:`metatomic-link-atoms` caps the bonds cut by the region
 with hydrogens. Models can request the topology charges as input. Without
 :mdp:`metatomic-oniom`, the Metatomic energy is now added on top of the
 unmodified classical topology.
+
+Metatomic models on several separate sites
+""""""""""""""""""""""""""""""""""""""""""
+
+``metatomic-site-groups`` splits the Metatomic input group into sites, each
+evaluated as its own system, so the model sees no pairs between sites; with
+ONIOM, only the classical interactions within a site are removed.
+``metatomic-site-charges`` and ``metatomic-site-spin-multiplicities`` give the
+total charge and spin multiplicity of each site, for models that take them as
+input. With domain decomposition, each site is evaluated whole by one rank.
