@@ -28,3 +28,13 @@ starting from 1. This means that the AMBER19SB and AMBER14SB force fields now us
 hydrogen names, (i.e. HB2 and HB3 for methylene hydrogens instead of HB1 and HB2). This is more
 consistent with the naming in the original Amber force field files and with the IUPAC standard
 for hydrogen names.
+
+Embedded-system preprocessing keeps boundary angles and dihedrals
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+The topology preprocessing shared by QM/MM, NNPot and Metatomic now removes an
+angle or a dihedral only when all its atoms are in the embedded region, where
+before it removed angles with two and dihedrals with three embedded atoms.
+Terms with an atom outside the region stay in the classical force field.
+SETTLE with two embedded atoms is still converted. This changes the energy of
+QM/MM and NNPot simulations with bonds crossing the region boundary.

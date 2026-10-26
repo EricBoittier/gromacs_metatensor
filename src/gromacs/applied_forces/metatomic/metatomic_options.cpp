@@ -117,10 +117,10 @@ void preprocessTopology(gmx_mtop_t* mtop, ArrayRef<const Index> mtaIndices, cons
     // 4) Make F_CONNBOND between atoms within QM region
     modifyEmbeddedTwoCenterInteractions(mtop, mtaIndicesSet, isMTABlock, logger);
 
-    // 5) Remove angles and settles containing 2 or more QM atoms
+    // 5) Remove angles containing all ML atoms, and settles containing 2 or more ML atoms
     modifyEmbeddedThreeCenterInteractions(mtop, mtaIndicesSet, isMTABlock, logger);
 
-    // 6) Remove dihedrals containing 3 or more QM atoms
+    // 6) Remove dihedrals containing all ML atoms
     modifyEmbeddedFourCenterInteractions(mtop, mtaIndicesSet, isMTABlock, logger);
 
     // 7) Check for constrained bonds in subsystem
