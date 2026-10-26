@@ -40,12 +40,17 @@
 
 #include "embedded_coulomb_correction.h"
 
+#include "config.h"
+
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <vector>
 
 #include "gromacs/math/units.h"
+#include "gromacs/utility/vec.h"
 #include "gromacs/mdlib/gmx_omp_nthreads.h"
 #include "gromacs/mdtypes/enerdata.h"
 #include "gromacs/mdtypes/forceoutput.h"
@@ -57,6 +62,10 @@
 #include "gromacs/utility/exceptions.h"
 #include "gromacs/utility/mpicomm.h"
 #include "gromacs/utility/stringutil.h"
+
+#if GMX_GPU_CUDA
+#    include "embedded_coulomb_correction_gpu.h"
+#endif
 
 namespace gmx
 {
@@ -215,6 +224,15 @@ EmbeddedCoulombCorrectionProvider::EmbeddedCoulombCorrectionProvider(const Local
 {
 }
 
+#if !GMX_GPU_CUDA
+//! Never created without CUDA; the definition lets the provider's unique_ptr be destroyed
+class EmbeddedCoulombCorrectionGpu
+{
+};
+#endif
+
+EmbeddedCoulombCorrectionProvider::~EmbeddedCoulombCorrectionProvider() = default;
+
 void EmbeddedCoulombCorrectionProvider::calculateForces(const ForceProviderInput& input,
                                                         ForceProviderOutput*      output)
 {
@@ -243,9 +261,50 @@ void EmbeddedCoulombCorrectionProvider::calculateForces(const ForceProviderInput
 
     t_pbc pbc;
     set_pbc(&pbc, pbcType_, input.box_);
-    const auto correction = computeEmbeddedCoulombCorrection(
-            x, charges_, pbc, *input.interactionConst_, energyGroups_, numEnergyGroups_, sites_,
-            gmx_omp_nthreads_get(ModuleMultiThread::Default));
+    const auto cpu = [&]() {
+        return computeEmbeddedCoulombCorrection(x, charges_, pbc, *input.interactionConst_,
+                                                energyGroups_, numEnergyGroups_, sites_,
+                                                gmx_omp_nthreads_get(ModuleMultiThread::Default));
+    };
+    EmbeddedCoulombCorrection correction;
+    bool                      onGpu = false;
+#if GMX_GPU_CUDA
+    if (firstStep_ && !std::getenv("GMX_METATOMIC_ECC_CPU"))
+    {
+        gpu_ = std::make_unique<EmbeddedCoulombCorrectionGpu>(charges_, energyGroups_,
+                                                              numEnergyGroups_, sites_);
+    }
+    onGpu = gpu_ && gpu_->compute(x, pbc, *input.interactionConst_, &correction);
+#endif
+    if (!onGpu)
+    {
+        correction = cpu();
+    }
+    else if (firstStep_ && std::getenv("GMX_METATOMIC_ECC_CHECK"))
+    {
+        const auto   reference = cpu();
+        double       maxForce = 0, maxForceDiff = 0, maxVirialDiff = 0;
+        for (size_t i = 0; i < x.size(); i++)
+        {
+            maxForce     = std::max(maxForce, double(norm(reference.forces[i])));
+            maxForceDiff = std::max(maxForceDiff, double(norm(correction.forces[i] - reference.forces[i])));
+        }
+        for (int d = 0; d < DIM; d++)
+        {
+            for (int e = 0; e < DIM; e++)
+            {
+                maxVirialDiff = std::max(maxVirialDiff,
+                                         double(std::abs(correction.virial[d][e] - reference.virial[d][e])));
+            }
+        }
+        std::fprintf(stderr,
+                     "Embedded Coulomb correction, GPU vs CPU: energy %.8g vs %.8g kJ/mol, "
+                     "pairs %d vs %d, max force difference %.3g of max force %.3g kJ/mol/nm, "
+                     "max virial difference %.3g kJ/mol\n",
+                     correction.energy, reference.energy, correction.numPairs, reference.numPairs,
+                     maxForceDiff, maxForce, maxVirialDiff);
+    }
+    firstStep_ = false;
 
     auto force = output->forceWithVirial_.force_;
     for (size_t k = 0; k < atoms_.numAtomsLocal(); k++)

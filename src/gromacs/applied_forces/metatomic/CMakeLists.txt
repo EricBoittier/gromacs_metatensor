@@ -51,6 +51,10 @@ else()
     )
 endif()
 
+if (GMX_GPU_CUDA)
+    gmx_add_libgromacs_sources(embedded_coulomb_correction_gpu.cu)
+endif()
+
 if (BUILD_TESTING)
     add_subdirectory(tests)
 endif()
