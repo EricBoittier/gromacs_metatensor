@@ -91,6 +91,11 @@ class PlainPairlistRanges;
  * via sparse indexed communication (allgatherv pattern). Falls back to dense
  * allreduce for small systems (N_total_mta < 1000).
  *
+ * **Units**: the system is given to the model in the model's length unit and
+ * the energy is requested in kJ/mol, so the positions gradient is converted
+ * from kJ/mol per model length unit to kJ/mol/nm here, independent of how
+ * metatomic converts gradients for systems in another unit.
+ *
  * **Shift convention**: GROMACS shifts atom I (first):
  * d = x[I]+shift - x[J]. Metatensor convention: r_ij = x[J] + cell_shift*box
  * - x[I]. Therefore metatensor cell shifts = negated GROMACS cell shifts.

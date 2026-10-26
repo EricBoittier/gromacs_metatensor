@@ -47,6 +47,11 @@
  *    for small systems (N_total < 1000).
  *  - Ghost deduplication: periodic ghost images share the same model index
  *    but all GROMACS local indices are mapped via gmxLocalToMtaIdx_.
+ *  - Units: the system is handed to execute_model in the model's own length
+ *    unit, so metatomic converts no lengths and the positions gradient comes
+ *    back per model length unit whatever metatomic-core version is used
+ *    (metatensor/metatomic#369 changes that conversion for systems in another
+ *    unit). GROMACS converts it to kJ/mol/nm itself.
  *
  * \author Metatensor developers <https://github.com/metatensor>
  * \ingroup module_applied_forces
@@ -309,6 +314,8 @@ struct MetatomicData
     std::vector<metatomic::PairListOptions> pairLists;
     //! Each pair-list cutoff converted to nm at init.
     std::vector<double> cutoffNm;
+    //! Model length unit, used for the systems handed to the model, and its size in nm.
+    std::string         lengthUnit      = "nm";
     double              lengthToNm      = 1.0;
     bool                useFloat64      = true;
     bool                checkConsistency = false;
@@ -340,7 +347,7 @@ struct MetatomicData
     std::optional<metatensor::Labels> selectedAtoms;
     int32_t                           selectedCount = -1;
 
-    //! Buffers used when GROMACS `real` is not the model dtype.
+    //! Buffers used when GROMACS `real` is not the model dtype or nm is not the model length unit.
     std::vector<double> positions64;
     std::vector<float>  positions32;
     std::vector<double> cell64;
@@ -413,7 +420,8 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
         data_->model = std::make_unique<metatomic::ExternalModel>(
                 metatomic::load_model(options_.params_.modelPath_, modelOptions));
         data_->capabilities = data_->model->capabilities();
-        data_->lengthToNm   = metatomic::unit_conversion_factor(data_->capabilities.length_unit(), "nm");
+        data_->lengthUnit   = data_->capabilities.length_unit();
+        data_->lengthToNm   = metatomic::unit_conversion_factor(data_->lengthUnit, "nm");
     }
     catch (const std::exception& e)
     {
@@ -1209,9 +1217,12 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         const bool          gromacsIsDouble = std::is_same_v<real, double>;
         std::vector<int32_t> types(atomNumbers_.begin(), atomNumbers_.begin() + nAtoms);
 
+        // Positions, cell and pair vectors go to the model in its own length unit.
+        const double nmToModel = 1.0 / data_->lengthToNm;
+
         void* positionData = nullptr;
         void* cellData     = nullptr;
-        if (modelIsDouble == gromacsIsDouble)
+        if (modelIsDouble == gromacsIsDouble && nmToModel == 1.0)
         {
             positionData = positions_.data();
             cellData     = &box_[0][0];
@@ -1227,14 +1238,14 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 {
                     for (int d = 0; d < 3; ++d)
                     {
-                        positions[3 * i + d] = static_cast<T>(positions_[i][d]);
+                        positions[3 * i + d] = static_cast<T>(nmToModel * positions_[i][d]);
                     }
                 }
                 for (int a = 0; a < 3; ++a)
                 {
                     for (int b = 0; b < 3; ++b)
                     {
-                        cell[3 * a + b] = static_cast<T>(box_[a][b]);
+                        cell[3 * a + b] = static_cast<T>(nmToModel * box_[a][b]);
                     }
                 }
                 positionData = positions.data();
@@ -1251,7 +1262,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         }
 
         auto system = metatomic::System(
-                "nm",
+                data_->lengthUnit,
                 wrap_dlpack(types.data(), { nAtoms }, { kDLInt, 32, 1 }),
                 wrap_dlpack(positionData, { nAtoms, 3 }, floatType),
                 wrap_dlpack(cellData, { 3, 3 }, floatType),
@@ -1321,6 +1332,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             components.push_back(metatensor::Labels({ "xyz" }, xyzValues, 3));
             auto properties = metatensor::Labels({ "distance" }, &distanceValue, 1);
 
+            // Pair vectors were built in nm, the model reads its own length unit.
             std::unique_ptr<metatensor::DataArrayBase> values;
             const auto shape = std::vector<uintptr_t>{ static_cast<uintptr_t>(nPairs), 3, 1 };
             if (modelIsDouble)
@@ -1328,7 +1340,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 std::vector<double> packed(static_cast<size_t>(nPairs) * 3);
                 for (size_t i = 0; i < packed.size(); ++i)
                 {
-                    packed[i] = nlVectorsBuffer_[i];
+                    packed[i] = nmToModel * nlVectorsBuffer_[i];
                 }
                 values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::move(packed));
             }
@@ -1337,7 +1349,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 std::vector<float> packed(static_cast<size_t>(nPairs) * 3);
                 for (size_t i = 0; i < packed.size(); ++i)
                 {
-                    packed[i] = static_cast<float>(nlVectorsBuffer_[i]);
+                    packed[i] = static_cast<float>(nmToModel * nlVectorsBuffer_[i]);
                 }
                 values = std::make_unique<metatensor::SimpleDataArray<float>>(shape, std::move(packed));
             }
@@ -1431,14 +1443,19 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             }
             auto posGrad    = block.gradient("positions");
             auto strainGrad = block.gradient("strain");
+            // The energy is in the requested kJ/mol, and the system was in the model's
+            // length unit, so the positions gradient is in kJ/mol per model length unit,
+            // with or without metatensor/metatomic#369. The strain gradient is per
+            // (dimensionless) strain.
+            const double forceScale = -nmToModel;
             if (modelIsDouble)
             {
-                add_atom_rows<double>(posGrad, 2, nAtoms, -1.0, &forces);
+                add_atom_rows<double>(posGrad, 2, nAtoms, forceScale, &forces);
                 add_strain<double>(strainGrad, virialMatrix);
             }
             else
             {
-                add_atom_rows<float>(posGrad, 2, nAtoms, -1.0, &forces);
+                add_atom_rows<float>(posGrad, 2, nAtoms, forceScale, &forces);
                 add_strain<float>(strainGrad, virialMatrix);
             }
         }

@@ -394,9 +394,21 @@ TEST_F(MetatomicForceProviderTest, ModelInNanometre)
     checkAgainstLennardJones();
 }
 
+/* The system is handed to metatomic in the model's length unit and the positions
+ * gradient converted to kJ/mol/nm here. Converting it again in GROMACS for a system
+ * passed in nm (the workaround metatensor/metatomic#369 makes wrong) would give
+ * forces 10x too large with #369, and keeping the system in nm without converting
+ * would give them 10x too small without it. */
+TEST_F(MetatomicForceProviderTest, ModelInAngstromAndElectronvolt)
+{
+    setModelUnits("Angstrom", "eV");
+    evaluate(c_cubicBox, RVec(0.21, 0.24, 0.17), IVec(0, 0, 0));
+    checkAgainstLennardJones();
+}
+
 TEST_F(MetatomicForceProviderTest, ChecksConsistencyOfInputsAndOutputs)
 {
-    setModelUnits("nm", "kJ/mol");
+    setModelUnits("Angstrom", "eV");
     options_.params_.checkConsistency = true;
     evaluate(c_cubicBox, RVec(0.21, 0.24, 0.17), IVec(0, 0, 0));
     checkAgainstLennardJones();
@@ -407,7 +419,7 @@ TEST_F(MetatomicForceProviderTest, PairAcrossTriclinicBoundary)
     // The lattice shift of a pair is n_a a + n_b b + n_c c, which differs from box . n
     // as soon as the box is not rectangular.
     const matrix box = { { 3, 0, 0 }, { 1.2, 3, 0 }, { -0.9, 1.1, 3 } };
-    setModelUnits("nm", "kJ/mol");
+    setModelUnits("Angstrom", "eV");
     evaluate(box, RVec(0.21, -0.24, 0.17), IVec(1, -1, 1));
     checkAgainstLennardJones();
 }

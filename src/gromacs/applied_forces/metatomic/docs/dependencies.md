@@ -54,6 +54,26 @@ versions found:
 -- Found metatomic 0.2.0-dev1226+git.07cb876 (metatensor 0.2.6): Metatomic potential support enabled.
 ```
 
+## Units, and metatensor/metatomic#369
+
+The force provider hands `execute_model` its system in the **model's own
+length unit** (positions, cell and pair vectors are scaled from nm), requests
+the energy in kJ/mol, and converts the positions gradient from kJ/mol per model
+length unit to kJ/mol/nm itself.
+
+This makes the forces independent of a change in metatomic-core. Up to
+07cb8766, `execute_model` converts a system given in another length unit to the
+model's unit but scales outputs and gradients by the energy factor only, so the
+positions gradient stays per model length unit. Open PR
+[#369](https://github.com/metatensor/metatomic/pull/369) also applies the length
+factor to the positions gradient. A system in nm with a GROMACS-side factor of
+1 / (model unit in nm), as the C-API branch did before (`617316faab`), is right
+before #369 and 10x too large for an Angstrom model after it. With the system
+in the model's unit, metatomic converts no length either way.
+`tests/metatomic_forceprovider.cpp` checks the forces of a model in Angstrom
+against the analytic values; run against a metatomic-core with #369 it passes,
+and with the earlier conversion it fails with forces 10x too large.
+
 ## The metatensor floor has to track metatomic-core's
 
 `metatomic-config.cmake` runs its own `find_package(metatensor
