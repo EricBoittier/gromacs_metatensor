@@ -118,3 +118,7 @@ pin `a245aed8` no longer exists upstream (`9e1de9a4` has the same
 
 This is the reason the build prints the versions it found: the dependency is a
 branch, and it moved under this module after the module was written.
+
+CI (`.github/workflows/metatomic-capi.yml`) builds metatomic-core at the same
+commit, configures with `GMX_METATOMIC=ON` and runs the unit tests: bump the
+commit there and here together.

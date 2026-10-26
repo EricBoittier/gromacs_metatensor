@@ -9,7 +9,11 @@ on:
         default: "main"
   push:
     branches: [metatomic]
+  # The pixi environment builds the libtorch interface (-DGMX_METATOMIC=TORCH,
+  # no metatomic-core), which the C API branches (gmx/**) no longer have: only
+  # run on pull requests into metatomic. metatomic-capi.yml tests the C API.
   pull_request:
+    branches: [metatomic]
 
 jobs:
   test:
