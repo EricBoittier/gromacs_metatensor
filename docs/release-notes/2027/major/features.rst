@@ -39,3 +39,15 @@ later (pinned to 07cb8766). With domain decomposition every rank evaluates all
 model atoms and pairs, which message-passing models need, and the plain
 pairlist range is the model's pair-list cutoff plus a buffer, rather than its
 interaction range.
+
+ONIOM embedding for Metatomic models
+""""""""""""""""""""""""""""""""""""
+
+:mdp:`metatomic-oniom` evaluates a Metatomic model on part of the system in the
+subtractive ONIOM scheme: the classical bonded terms inside the region and the
+non-bonded interactions among its atoms are removed, including the Coulomb
+interaction beyond the cut-off, with Ewald, PME, reaction-field or plain cut-off
+electrostatics. :mdp:`metatomic-link-atoms` caps the bonds cut by the region
+with hydrogens. Models can request the topology charges as input. Without
+:mdp:`metatomic-oniom`, the Metatomic energy is now added on top of the
+unmodified classical topology.

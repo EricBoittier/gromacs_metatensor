@@ -47,6 +47,7 @@
 
 #include "gromacs/mdtypes/imdpoptionprovider.h"
 #include "gromacs/topology/atoms.h"
+#include "gromacs/topology/embedded_system_preprocessing.h"
 
 // some forward declarations
 struct gmx_mtop_t;
@@ -64,6 +65,7 @@ class KeyValueTreeObject;
 class IndexGroupsAndNames;
 class LocalAtomSet;
 class MpiComm;
+struct ExclusionDistanceExemptions;
 
 
 //!\brief \internal Data structure to store Metatomic input parameters
@@ -104,6 +106,12 @@ struct MetatomicParameters
     //! (default whole System)
     std::string inputGroup = "System";
 
+    //! Enable subtractive ONIOM topology preprocessing
+    bool oniom = false;
+
+    //! Enable ONIOM link atoms at cut bonds between ML and MM regions
+    bool linkAtoms = false;
+
     std::vector<Index>            mtaIndices_;
     std::vector<Index>            mmIndices_;
     std::unique_ptr<LocalAtomSet> mtaAtoms_;
@@ -111,6 +119,15 @@ struct MetatomicParameters
     t_atoms                       atoms_;
     int                           numAtoms_;
     std::unique_ptr<PbcType>      pbcType_;
+
+    //! Link frontier atoms (bonds crossing ML/MM boundary)
+    std::vector<LinkFrontierAtom> linkFrontier_;
+    //! Topology charges indexed by global atom
+    std::vector<real>             mmCharges_;
+    //! Energy group of every atom, from the simulation topology
+    std::vector<int> energyGroups_;
+    //! Number of energy groups
+    int numEnergyGroups_ = 1;
 };
 
 class MetatomicOptions final : public IMdpOptionProvider
@@ -136,6 +153,9 @@ public:
 
     //! set local MM atom set during simulation setup
     void setLocalgmxMMAtomSet(const LocalAtomSet&);
+
+    //! With ONIOM, exempt the mutual exclusions of the ML atoms from grompp's distance check
+    void addExclusionDistanceExemptions(ExclusionDistanceExemptions* exemptions) const;
 
     const MetatomicParameters& parameters();
     const MDLogger&            logger() const;

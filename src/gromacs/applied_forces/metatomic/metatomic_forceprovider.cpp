@@ -66,6 +66,7 @@
 
 #include <algorithm>
 #include <array>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -86,6 +87,7 @@
 #include "gromacs/utility/logger.h"
 #include "gromacs/utility/mpicomm.h"
 #include "gromacs/utility/stringutil.h"
+#include "gromacs/utility/vec.h"
 
 #include "metatomic_timer.h"
 
@@ -196,6 +198,56 @@ static RVec cellShiftVector(const matrix box, const IVec& cellShift)
     return { cellShift[XX] * box[XX][XX] + cellShift[YY] * box[YY][XX] + cellShift[ZZ] * box[ZZ][XX],
              cellShift[YY] * box[YY][YY] + cellShift[ZZ] * box[ZZ][YY],
              cellShift[ZZ] * box[ZZ][ZZ] };
+}
+
+//! Whether a requested model input is the per-atom charge (`charge`, `charge/<variant>`).
+static bool isChargeInput(const std::string& name)
+{
+    return name == "charge" || name.rfind("charge/", 0) == 0;
+}
+
+//! One ONIOM link cap, resolved to model rows for the current step.
+struct ActiveLinkAtom
+{
+    //! Model rows of the embedded atom and of the boundary MM atom.
+    int32_t embedded = -1;
+    int32_t mm       = -1;
+    //! Model row holding the cap: the MM row for the first cap on an MM atom, an extra row otherwise.
+    int32_t row = -1;
+    //! Minimum-image cell shift from the embedded atom to the MM atom.
+    IVec mmCellShift  = IVec(0, 0, 0);
+    real linkDistance = 0;
+};
+
+//! Cell shift (in box vectors) bringing `dx` to its minimum image, for a triclinic GROMACS box.
+static IVec minimumImageCellShift(const matrix boxInv, PbcType pbcType, const RVec& dx)
+{
+    IVec shift(0, 0, 0);
+    if (pbcType == PbcType::No)
+    {
+        return shift;
+    }
+    shift[XX] = static_cast<int>(
+            std::round(-(boxInv[XX][XX] * dx[XX] + boxInv[YY][XX] * dx[YY] + boxInv[ZZ][XX] * dx[ZZ])));
+    shift[YY] = static_cast<int>(std::round(-(boxInv[YY][YY] * dx[YY] + boxInv[ZZ][YY] * dx[ZZ])));
+    if (pbcType != PbcType::XY)
+    {
+        shift[ZZ] = static_cast<int>(std::round(-(boxInv[ZZ][ZZ] * dx[ZZ])));
+    }
+    return shift;
+}
+
+//! Position of a cap at `linkDistance` from the embedded atom, towards the (shifted) MM atom.
+static RVec linkAtomPosition(const RVec& embedded, const RVec& mm, const RVec& mmShift, real linkDistance)
+{
+    const RVec bond   = mm + mmShift - embedded;
+    const real length = norm(bond);
+    if (length == 0.0_real)
+    {
+        GMX_THROW(InconsistentInputError(
+                "Metatomic link atom construction found a zero-length boundary bond."));
+    }
+    return embedded + (linkDistance / length) * bond;
 }
 
 template<typename T>
@@ -342,6 +394,9 @@ struct MetatomicData
 
     //! Non-conservative mode: forces/stress are outputs, not energy gradients.
     bool nonConservative = false;
+
+    //! Requested per-atom charge inputs, filled from the topology charges.
+    std::vector<metatomic::Quantity> chargeInputs;
 
     //! Home-atom selection. Rebuilt when numHomeMta_ changes.
     std::optional<metatensor::Labels> selectedAtoms;
@@ -574,11 +629,37 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
     {
         GMX_THROW(APIError("Failed to query the metatomic model: " + std::string(e.what())));
     }
-    if (!inputs.empty())
+    for (const auto& input : inputs)
     {
-        GMX_THROW(APIError(formatString(
-                "The model requests the input '%s', which GROMACS can not provide.",
-                inputs.front().name().c_str())));
+        if (!isChargeInput(input.name()))
+        {
+            GMX_THROW(APIError(formatString(
+                    "The model requests the input '%s', which GROMACS can not provide "
+                    "(only 'charge' is supported).",
+                    input.name().c_str())));
+        }
+        if (input.sample_kind() != metatomic::SampleKind::Atom)
+        {
+            GMX_THROW(APIError(formatString("The model requests '%s' per system; GROMACS only "
+                                            "provides per-atom charges.",
+                                            input.name().c_str())));
+        }
+        if (options_.params_.mmCharges_.empty())
+        {
+            GMX_THROW(InconsistentInputError(formatString(
+                    "The model requests '%s', but no topology charges are available.",
+                    input.name().c_str())));
+        }
+        data_->chargeInputs.push_back(input);
+    }
+
+    linkFrontiers_ = options_.params_.linkFrontier_;
+    if (!linkFrontiers_.empty())
+    {
+        GMX_LOG(logger_.info)
+                .asParagraph()
+                .appendTextFormatted("Metatomic: %zu link atoms at the ML/MM boundary",
+                                     linkFrontiers_.size());
     }
     data_->cutoffNm.reserve(data_->pairLists.size());
     for (const auto& pairs : data_->pairLists)
@@ -1201,6 +1282,80 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                               backwardShiftsMta_.end());
     }
 
+    // ONIOM link caps. The frontier holds global atom indices; resolve them to
+    // model rows now, after gathering the atoms of other ranks. The first cap on a
+    // boundary MM atom takes over that atom's row, further caps on the same
+    // MM atom get extra rows after the local atoms.
+    const int32_t               nLocal = numLocalMta_;
+    std::vector<int32_t>        modelTypes(atomNumbers_.begin(), atomNumbers_.begin() + nLocal);
+    std::vector<int32_t>        chargeSource(nLocal); // row whose atom provides each row's charge
+    std::iota(chargeSource.begin(), chargeSource.end(), 0);
+    std::vector<ActiveLinkAtom> links;
+    const PbcType pbcType = options_.params_.pbcType_ ? *options_.params_.pbcType_ : PbcType::Xyz;
+    matrix        boxInv;
+    clear_mat(boxInv);
+    if (pbcType != PbcType::No)
+    {
+        invertBoxMatrix(inputs.box_, boxInv);
+    }
+    if (!linkFrontiers_.empty())
+    {
+        std::unordered_map<int32_t, int32_t> rowOfGlobalAtom;
+        rowOfGlobalAtom.reserve(nLocal);
+        for (int32_t i = 0; i < nLocal; ++i)
+        {
+            rowOfGlobalAtom.emplace(static_cast<int32_t>(options_.params_.mtaIndices_[mtaToGlobalMta_[i]]), i);
+        }
+        std::unordered_set<int32_t> cappedMM;
+        for (const auto& frontier : linkFrontiers_)
+        {
+            const auto embedded = rowOfGlobalAtom.find(frontier.getEmbeddedIndex());
+            const auto mm       = rowOfGlobalAtom.find(frontier.getMMIndex());
+            if (embedded == rowOfGlobalAtom.end() || mm == rowOfGlobalAtom.end())
+            {
+                continue; // not both on this rank
+            }
+            ActiveLinkAtom link;
+            link.embedded     = embedded->second;
+            link.mm           = mm->second;
+            link.linkDistance = frontier.linkDistance();
+            link.mmCellShift  = minimumImageCellShift(
+                    boxInv, pbcType, positions_[link.mm] - positions_[link.embedded]);
+            if (cappedMM.insert(link.mm).second)
+            {
+                link.row = link.mm;
+            }
+            else
+            {
+                link.row = static_cast<int32_t>(modelTypes.size());
+                modelTypes.push_back(0);
+                chargeSource.push_back(link.mm);
+            }
+            modelTypes[link.row] = frontier.linkAtomNumber();
+            links.push_back(link);
+        }
+    }
+    const int32_t nModel = static_cast<int32_t>(modelTypes.size());
+
+    // Positions of every model row: local atoms, with caps in their rows.
+    std::vector<RVec> capPositions;
+    std::vector<char> isCapRow(nModel, 0);
+    if (!links.empty())
+    {
+        capPositions.assign(positions_.begin(), positions_.begin() + nLocal);
+        capPositions.resize(nModel);
+        for (const auto& link : links)
+        {
+            capPositions[link.row] = linkAtomPosition(positions_[link.embedded],
+                                                      positions_[link.mm],
+                                                      cellShiftVector(inputs.box_, link.mmCellShift),
+                                                      link.linkDistance);
+            isCapRow[link.row] = 1;
+        }
+    }
+    const auto modelPosition = [&](int32_t row) -> const RVec&
+    { return links.empty() ? positions_[row] : capPositions[row]; };
+
     // Model inference
     double energy = 0.0;
     matrix virialMatrix;
@@ -1210,19 +1365,17 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         MetatomicTimer modelTimer("model inference", mpiComm_);
         MetatomicTimer tensorPrepTimer("tensorPrep", mpiComm_);
 
-        const int32_t       nAtoms       = numLocalMta_;
-        const bool          modelIsDouble = data_->useFloat64;
-        const DLDataType    floatType    = modelIsDouble ? DLDataType{ kDLFloat, 64, 1 }
+        const bool       modelIsDouble   = data_->useFloat64;
+        const DLDataType floatType       = modelIsDouble ? DLDataType{ kDLFloat, 64, 1 }
                                                          : DLDataType{ kDLFloat, 32, 1 };
-        const bool          gromacsIsDouble = std::is_same_v<real, double>;
-        std::vector<int32_t> types(atomNumbers_.begin(), atomNumbers_.begin() + nAtoms);
+        const bool       gromacsIsDouble = std::is_same_v<real, double>;
 
         // Positions, cell and pair vectors go to the model in its own length unit.
         const double nmToModel = 1.0 / data_->lengthToNm;
 
         void* positionData = nullptr;
         void* cellData     = nullptr;
-        if (modelIsDouble == gromacsIsDouble && nmToModel == 1.0)
+        if (modelIsDouble == gromacsIsDouble && nmToModel == 1.0 && links.empty())
         {
             positionData = positions_.data();
             cellData     = &box_[0][0];
@@ -1232,13 +1385,13 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             const auto fill = [&](auto& positions, auto& cell)
             {
                 using T = typename std::decay_t<decltype(positions)>::value_type;
-                positions.resize(static_cast<size_t>(nAtoms) * 3);
+                positions.resize(static_cast<size_t>(nModel) * 3);
                 cell.resize(9);
-                for (int32_t i = 0; i < nAtoms; ++i)
+                for (int32_t i = 0; i < nModel; ++i)
                 {
                     for (int d = 0; d < 3; ++d)
                     {
-                        positions[3 * i + d] = static_cast<T>(nmToModel * positions_[i][d]);
+                        positions[3 * i + d] = static_cast<T>(nmToModel * modelPosition(i)[d]);
                     }
                 }
                 for (int a = 0; a < 3; ++a)
@@ -1263,13 +1416,63 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
 
         auto system = metatomic::System(
                 data_->lengthUnit,
-                wrap_dlpack(types.data(), { nAtoms }, { kDLInt, 32, 1 }),
-                wrap_dlpack(positionData, { nAtoms, 3 }, floatType),
+                wrap_dlpack(modelTypes.data(), { nModel }, { kDLInt, 32, 1 }),
+                wrap_dlpack(positionData, { nModel, 3 }, floatType),
                 wrap_dlpack(cellData, { 3, 3 }, floatType),
                 wrap_dlpack(data_->pbc.data(), { 3 }, { kDLBool, 8, 1 }));
+
+        // Topology charges; a cap carries the charge of the MM atom it replaces.
+        for (const auto& input : data_->chargeInputs)
+        {
+            const double toUnit =
+                    input.unit().empty() ? 1.0 : metatomic::unit_conversion_factor("e", input.unit());
+            std::vector<double> charges(nModel);
+            for (int32_t i = 0; i < nModel; ++i)
+            {
+                const Index globalAtom = options_.params_.mtaIndices_[mtaToGlobalMta_[chargeSource[i]]];
+                if (globalAtom < 0 || globalAtom >= static_cast<Index>(options_.params_.mmCharges_.size()))
+                {
+                    GMX_THROW(InconsistentInputError(
+                            "Metatomic charge input contains an atom without a stored charge."));
+                }
+                charges[i] = toUnit * options_.params_.mmCharges_[globalAtom];
+            }
+            std::vector<int32_t> sampleValues(static_cast<size_t>(nModel) * 2, 0);
+            for (int32_t i = 0; i < nModel; ++i)
+            {
+                sampleValues[2 * i + 1] = i;
+            }
+            const int32_t zero  = 0;
+            const auto    shape = std::vector<uintptr_t>{ static_cast<uintptr_t>(nModel), 1 };
+            std::unique_ptr<metatensor::DataArrayBase> values;
+            if (modelIsDouble)
+            {
+                values = std::make_unique<metatensor::SimpleDataArray<double>>(shape, std::move(charges));
+            }
+            else
+            {
+                values = std::make_unique<metatensor::SimpleDataArray<float>>(
+                        shape, std::vector<float>(charges.begin(), charges.end()));
+            }
+            std::vector<metatensor::TensorBlock> blocks;
+            blocks.emplace_back(std::move(values),
+                                metatensor::Labels({ "system", "atom" },
+                                                   nModel == 0 ? nullptr : sampleValues.data(),
+                                                   static_cast<size_t>(nModel)),
+                                std::vector<metatensor::Labels>{},
+                                metatensor::Labels({ "charge" }, &zero, 1));
+            system.add_custom_data(input.name(),
+                                   metatensor::TensorMap(metatensor::Labels({ "_" }, &zero, 1),
+                                                         std::move(blocks)));
+        }
         tensorPrepTimer.stop();
 
         MetatomicTimer buildNLTimer("buildNL", mpiComm_);
+        std::vector<int32_t> capRows;
+        for (const auto& link : links)
+        {
+            capRows.push_back(link.row);
+        }
         for (size_t requestIndex = 0; requestIndex < data_->pairLists.size(); ++requestIndex)
         {
             const auto&   request = data_->pairLists[requestIndex];
@@ -1278,17 +1481,32 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             const double  cutoff  = data_->cutoffNm[requestIndex];
             const double  cutoff2 = cutoff * cutoff;
             const int64_t nHalf   = static_cast<int64_t>(pairlistMta_.size() / 2);
-            const int64_t maxPairs = full ? 2 * nHalf : nHalf;
-            nlSamplesBuffer_.resize(static_cast<size_t>(maxPairs) * 5);
-            nlVectorsBuffer_.resize(static_cast<size_t>(maxPairs) * 3);
+            nlSamplesBuffer_.clear();
+            nlVectorsBuffer_.clear();
+            nlSamplesBuffer_.reserve(static_cast<size_t>((full ? 2 : 1) * nHalf) * 5);
+            nlVectorsBuffer_.reserve(static_cast<size_t>((full ? 2 : 1) * nHalf) * 3);
 
-            int64_t outIdx = 0;
+            const auto addPair = [&](int32_t ai, int32_t aj, const IVec& n, double dx, double dy, double dz)
+            {
+                nlSamplesBuffer_.insert(nlSamplesBuffer_.end(), { ai, aj, n[XX], n[YY], n[ZZ] });
+                nlVectorsBuffer_.insert(nlVectorsBuffer_.end(), { dx, dy, dz });
+                if (full)
+                {
+                    nlSamplesBuffer_.insert(nlSamplesBuffer_.end(), { aj, ai, -n[XX], -n[YY], -n[ZZ] });
+                    nlVectorsBuffer_.insert(nlVectorsBuffer_.end(), { -dx, -dy, -dz });
+                }
+            };
+
             for (int64_t k = 0; k < nHalf; ++k)
             {
                 const int32_t ai = pairlistMta_[2 * k];
                 const int32_t aj = pairlistMta_[2 * k + 1];
-                const IVec&   n     = cellShiftsMta_[k];
-                const RVec    shift = cellShiftVector(inputs.box_, n);
+                if (!links.empty() && (isCapRow[ai] || isCapRow[aj]))
+                {
+                    continue; // the GROMACS pair is for the MM atom, not its cap
+                }
+                const IVec&  n     = cellShiftsMta_[k];
+                const RVec   shift = cellShiftVector(inputs.box_, n);
                 const double dx = static_cast<double>(positions_[aj][0] - positions_[ai][0] + shift[0]);
                 const double dy = static_cast<double>(positions_[aj][1] - positions_[ai][1] + shift[1]);
                 const double dz = static_cast<double>(positions_[aj][2] - positions_[ai][2] + shift[2]);
@@ -1296,31 +1514,31 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 {
                     continue;
                 }
-                nlSamplesBuffer_[5 * outIdx + 0] = ai;
-                nlSamplesBuffer_[5 * outIdx + 1] = aj;
-                nlSamplesBuffer_[5 * outIdx + 2] = n[0];
-                nlSamplesBuffer_[5 * outIdx + 3] = n[1];
-                nlSamplesBuffer_[5 * outIdx + 4] = n[2];
-                nlVectorsBuffer_[3 * outIdx + 0] = dx;
-                nlVectorsBuffer_[3 * outIdx + 1] = dy;
-                nlVectorsBuffer_[3 * outIdx + 2] = dz;
-                ++outIdx;
-                if (full)
+                addPair(ai, aj, n, dx, dy, dz);
+            }
+
+            // Cap pairs, from the cap positions (minimum image), always within the cutoff.
+            for (const int32_t ai : capRows)
+            {
+                for (int32_t aj = 0; aj < nModel; ++aj)
                 {
-                    nlSamplesBuffer_[5 * outIdx + 0] = aj;
-                    nlSamplesBuffer_[5 * outIdx + 1] = ai;
-                    nlSamplesBuffer_[5 * outIdx + 2] = -n[0];
-                    nlSamplesBuffer_[5 * outIdx + 3] = -n[1];
-                    nlSamplesBuffer_[5 * outIdx + 4] = -n[2];
-                    nlVectorsBuffer_[3 * outIdx + 0] = -dx;
-                    nlVectorsBuffer_[3 * outIdx + 1] = -dy;
-                    nlVectorsBuffer_[3 * outIdx + 2] = -dz;
-                    ++outIdx;
+                    if (aj == ai || (isCapRow[aj] && aj < ai))
+                    {
+                        continue; // cap-cap pairs once
+                    }
+                    const RVec   raw   = modelPosition(aj) - modelPosition(ai);
+                    const IVec   n     = minimumImageCellShift(boxInv, pbcType, raw);
+                    const RVec   shift = cellShiftVector(inputs.box_, n);
+                    const double dx    = static_cast<double>(raw[XX] + shift[XX]);
+                    const double dy    = static_cast<double>(raw[YY] + shift[YY]);
+                    const double dz    = static_cast<double>(raw[ZZ] + shift[ZZ]);
+                    if (dx * dx + dy * dy + dz * dz <= cutoff2)
+                    {
+                        addPair(ai, aj, n, dx, dy, dz);
+                    }
                 }
             }
-            const int64_t nPairs = outIdx;
-            nlSamplesBuffer_.resize(static_cast<size_t>(nPairs) * 5);
-            nlVectorsBuffer_.resize(static_cast<size_t>(nPairs) * 3);
+            const int64_t nPairs = static_cast<int64_t>(nlVectorsBuffer_.size() / 3);
 
             auto samples = metatensor::Labels(
                     data_->nlSampleNames,
@@ -1358,8 +1576,11 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         }
         buildNLTimer.stop();
 
+        // With domain decomposition, each rank returns its home atoms plus the
+        // caps whose embedded atom is home; a home MM row whose caps all belong
+        // to non-home embedded atoms is left to the rank owning them.
         std::optional<metatensor::Labels> selected;
-        if (useNewtonNL)
+        if (useNewtonNL && links.empty())
         {
             if (data_->selectedCount != numHomeMta_)
             {
@@ -1376,6 +1597,36 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 data_->selectedCount = numHomeMta_;
             }
             selected = data_->selectedAtoms;
+        }
+        else if (useNewtonNL)
+        {
+            std::vector<char> keep(nModel, 0);
+            std::fill(keep.begin(), keep.begin() + numHomeMta_, 1);
+            for (const auto& link : links)
+            {
+                if (link.row < numHomeMta_)
+                {
+                    keep[link.row] = 0;
+                }
+            }
+            for (const auto& link : links)
+            {
+                if (link.embedded < numHomeMta_)
+                {
+                    keep[link.row] = 1;
+                }
+            }
+            std::vector<int32_t> rows;
+            for (int32_t i = 0; i < nModel; ++i)
+            {
+                if (keep[i])
+                {
+                    rows.insert(rows.end(), { 0, i });
+                }
+            }
+            selected = metatensor::Labels(
+                    { "system", "atom" }, rows.empty() ? nullptr : rows.data(), rows.size() / 2);
+            data_->selectedCount = -1; // the cached home-only selection is stale
         }
 
         MetatomicTimer forwardTimer("execute_model", mpiComm_);
@@ -1419,7 +1670,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
 
         auto&               energyMap     = modelOutputs[data_->energyIndex];
         const auto          nEnergyBlocks = energyMap.keys().count();
-        std::vector<double> forces(static_cast<size_t>(nAtoms) * 3, 0.0);
+        std::vector<double> forces(static_cast<size_t>(nModel) * 3, 0.0);
         for (size_t blockId = 0; blockId < nEnergyBlocks; ++blockId)
         {
             auto block = energyMap.block_by_id(blockId);
@@ -1450,12 +1701,12 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             const double forceScale = -nmToModel;
             if (modelIsDouble)
             {
-                add_atom_rows<double>(posGrad, 2, nAtoms, forceScale, &forces);
+                add_atom_rows<double>(posGrad, 2, nModel, forceScale, &forces);
                 add_strain<double>(strainGrad, virialMatrix);
             }
             else
             {
-                add_atom_rows<float>(posGrad, 2, nAtoms, forceScale, &forces);
+                add_atom_rows<float>(posGrad, 2, nModel, forceScale, &forces);
                 add_strain<float>(strainGrad, virialMatrix);
             }
         }
@@ -1469,11 +1720,11 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
                 auto block = forceMap.block_by_id(blockId);
                 if (modelIsDouble)
                 {
-                    add_atom_rows<double>(block, 1, nAtoms, 1.0, &forces);
+                    add_atom_rows<double>(block, 1, nModel, 1.0, &forces);
                 }
                 else
                 {
-                    add_atom_rows<float>(block, 1, nAtoms, 1.0, &forces);
+                    add_atom_rows<float>(block, 1, nModel, 1.0, &forces);
                 }
             }
             if (data_->ncStressIndex.has_value())
@@ -1513,11 +1764,59 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             }
         }
 
+        // Spread each cap's force onto its embedded and MM atoms (exact chain
+        // rule for r_cap = r_emb + d u, u the unit embedded-MM bond). A cap row
+        // holds only the cap: the first cap on an MM atom replaced that atom.
+        // The model's strain derivative moved the cap with the box; the cap
+        // keeps its bond length d instead, which changes the virial by
+        // 0.5 d (u.F_cap) u (x) u per cap.
+        if (!links.empty())
+        {
+            std::vector<RVec> capForces(links.size());
+            for (size_t k = 0; k < links.size(); ++k)
+            {
+                for (int d = 0; d < 3; ++d)
+                {
+                    capForces[k][d] = static_cast<real>(forces[3 * links[k].row + d]);
+                }
+            }
+            for (const auto& link : links)
+            {
+                std::fill_n(forces.begin() + 3 * link.row, 3, 0.0);
+            }
+            for (size_t k = 0; k < links.size(); ++k)
+            {
+                const auto& link    = links[k];
+                const RVec  mmShift = cellShiftVector(inputs.box_, link.mmCellShift);
+                const auto [onEmbedded, onMM] = spreadLinkAtomForce(
+                        capForces[k], positions_[link.embedded], positions_[link.mm], mmShift, link.linkDistance);
+                for (int d = 0; d < 3; ++d)
+                {
+                    forces[3 * link.embedded + d] += static_cast<double>(onEmbedded[d]);
+                    forces[3 * link.mm + d] += static_cast<double>(onMM[d]);
+                }
+                if (!data_->nonConservative)
+                {
+                    const RVec   u     = unitVector(positions_[link.mm] + mmShift - positions_[link.embedded]);
+                    const double scale = 0.5 * link.linkDistance * static_cast<double>(dot(u, capForces[k]));
+                    for (int a = 0; a < 3; ++a)
+                    {
+                        for (int b = 0; b < 3; ++b)
+                        {
+                            virialMatrix[a][b] += static_cast<real>(scale * u[a] * u[b]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only the first nLocal rows are real atoms from here on.
         MetatomicTimer forceScatterTimer("forceScatter", mpiComm_);
         const double*  forceData = forces.data();
-        if (data_->nonConservative || !mpiComm_.isParallel())
+        if (!mpiComm_.isParallel() || (data_->nonConservative && links.empty()))
         {
-            const int32_t nApply = data_->nonConservative ? numHomeMta_ : nAtoms;
+            // Serial, or non-conservative outputs for home atoms only.
+            const int32_t nApply = mpiComm_.isParallel() ? numHomeMta_ : nLocal;
             for (int32_t i = 0; i < nApply; ++i)
             {
                 const int32_t gmxIdx = mtaToGmxLocal_[i];
@@ -1528,6 +1827,7 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
         }
         else
         {
+            // Caps can put force on halo MM atoms, which the owning rank must receive.
             distributeNonHomeForces(forceData, outputs);
         }
         forceScatterTimer.stop();

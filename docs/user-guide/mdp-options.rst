@@ -3836,8 +3836,9 @@ applied-forces framework. It is available when |Gromacs| was configured with
 ``-DGMX_METATOMIC=ON`` (or ``AUTO`` with metatomic-core found). The model sees
 the atoms of :mdp:`metatomic-input-group`, with the cell, the periodic
 boundary conditions and pair lists built from the |Gromacs| pairlist.
-:ref:`gmx grompp` removes the classical interactions among these atoms from
-the topology, as for :mdp:`nnpot-input-group`.
+By default the model's energy is added on top of the unmodified classical
+topology; :mdp:`metatomic-oniom` replaces the classical description of these
+atoms instead.
 
 .. mdp:: metatomic-active
 
@@ -3909,6 +3910,28 @@ the topology, as for :mdp:`nnpot-input-group`.
 
    Variant of the ``non_conservative_stress`` output. When both variants are
    given, they must be the same.
+
+.. mdp:: metatomic-oniom
+
+   (false)
+   Use the subtractive ONIOM scheme,
+   E = E\ :sub:`MM`\ (all) + E\ :sub:`ML`\ (embedded) - E\ :sub:`MM`\ (embedded).
+   :ref:`gmx grompp` removes the classical bonded terms with all atoms in
+   :mdp:`metatomic-input-group` and excludes the non-bonded pairs among them,
+   and mdrun removes the rest of their classical Coulomb interaction at any
+   distance. When disabled, the model's contribution is added on top of the
+   unmodified classical topology. See :ref:`metatomic`.
+
+.. mdp:: metatomic-link-atoms
+
+   (false)
+   Cap every bond between an atom of :mdp:`metatomic-input-group` and an MM
+   atom with a hydrogen, placed on the bond 0.1 nm from the embedded atom, in
+   the model's input. The bond itself, and
+   the angles and dihedrals through it, stay in the classical force field, and
+   the force on the cap is passed on to the two atoms of the bond. An MM atom
+   bonded to several embedded atoms gets one cap per bond. Requires
+   :mdp:`metatomic-oniom` and a model trained with hydrogen-capped boundaries.
 
 
 .. _mdp-fmm:

@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "gromacs/mdtypes/iforceprovider.h"
+#include "gromacs/topology/embedded_system_preprocessing.h"
 
 #include "metatomic_options.h"
 
@@ -90,6 +91,18 @@ class PlainPairlistRanges;
  * home forces are applied directly and non-home (halo) forces are exchanged
  * via sparse indexed communication (allgatherv pattern). Falls back to dense
  * allreduce for small systems (N_total_mta < 1000).
+ *
+ * ## ONIOM link caps
+ *
+ * With `metatomic-link-atoms`, every ML/MM bond cut by the model region gets a
+ * hydrogen cap on the embedded-to-MM bond, at `linkDistance` from the
+ * embedded atom. The first cap on a boundary MM atom replaces that atom's
+ * row in the model input; further caps on the same MM atom get extra rows
+ * after the local atoms. Pairs involving cap rows are rebuilt from the cap
+ * positions (minimum image), since the GROMACS pairlist only knows the MM
+ * atom. The cap force is spread onto the embedded and MM atoms with the
+ * exact chain rule (`spreadLinkAtomForce`), and the virial gets the matching
+ * correction for the cap's fixed bond length.
  *
  * **Units**: the system is given to the model in the model's length unit and
  * the energy is requested in kJ/mol, so the positions gradient is converted
@@ -224,6 +237,9 @@ private:
     //! Wrapped as a metatensor pair block and passed to `System::add_pairs`.
     std::vector<int32_t> nlSamplesBuffer_; //!< flat [n_pairs * 5]: i, j, cs_a, cs_b, cs_c
     std::vector<double>  nlVectorsBuffer_; //!< flat [n_pairs * 3]: dx, dy, dz
+
+    //! ONIOM link frontier, in global atom indices. Resolved to model rows every step.
+    std::vector<LinkFrontierAtom> linkFrontiers_;
 
     //! local copy of simulation box
     matrix box_;
