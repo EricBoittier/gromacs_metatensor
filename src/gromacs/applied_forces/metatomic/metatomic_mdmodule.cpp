@@ -230,7 +230,8 @@ public:
                     max_cutoff = interaction_range;
                 }
 
-                for (const auto& pairs : model.requested_pair_lists())
+                // Every declared output bounds the pair lists the provider requests.
+                for (const auto& pairs : model.requested_pair_lists(capabilities.outputs()))
                 {
                     max_cutoff = std::max(max_cutoff, pairs.cutoff() * toNm);
                 }

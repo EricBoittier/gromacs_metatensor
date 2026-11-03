@@ -463,7 +463,6 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
         data_->model = std::make_unique<metatomic::ExternalModel>(
                 metatomic::load_model(options_.params_.modelPath_));
         data_->capabilities = data_->model->capabilities();
-        data_->pairLists    = data_->model->requested_pair_lists();
     }
     catch (const std::exception& e)
     {
@@ -479,12 +478,6 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
     }
     data_->checkConsistency = options_.params_.checkConsistency;
     pbc_flags(options_.params_.pbcType_.get(), &data_->pbc);
-
-    data_->cutoffNm.reserve(data_->pairLists.size());
-    for (const auto& pairs : data_->pairLists)
-    {
-        data_->cutoffNm.push_back(pairs.cutoff() * data_->lengthToNm);
-    }
 
     GMX_LOG(logger_.info)
             .asParagraph()
@@ -515,10 +508,14 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
 
     data_->nonConservative = options_.params_.nonConservative;
     {
+        // The plugin computes the gradients, and backends such as metatomic-torch's
+        // LegacyModel only differentiate a per-system energy. selected_atoms already
+        // restricts that sum to home atoms under domain decomposition.
         auto energy = metatomic::Quantity::builder()
                               .name(data_->energyName)
                               .unit("kJ/mol")
-                              .sample_kind(energyCap->sample_kind());
+                              .sample_kind(data_->nonConservative ? energyCap->sample_kind()
+                                                                  : metatomic::SampleKind::System);
         if (!data_->nonConservative)
         {
             energy.add_gradient(metatomic::Gradients::Positions)
@@ -610,6 +607,21 @@ MetatomicForceProvider::MetatomicForceProvider(const MetatomicOptions& options,
                         "Metatomic: non-conservative mode enabled. Forces from '%s'%s",
                         forceName.c_str(),
                         data_->ncStressIndex.has_value() ? ", with stress" : "");
+    }
+
+    // Pair lists depend on the requested outputs, so ask once they are known.
+    try
+    {
+        data_->pairLists = data_->model->requested_pair_lists(data_->requested);
+    }
+    catch (const std::exception& e)
+    {
+        GMX_THROW(APIError("Failed to get the metatomic model pair lists: " + std::string(e.what())));
+    }
+    data_->cutoffNm.reserve(data_->pairLists.size());
+    for (const auto& pairs : data_->pairLists)
+    {
+        data_->cutoffNm.push_back(pairs.cutoff() * data_->lengthToNm);
     }
 
     GMX_LOG(logger_.info)
