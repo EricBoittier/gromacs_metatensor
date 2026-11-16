@@ -97,17 +97,27 @@ EmbeddedCoulombCorrection computeEmbeddedCoulombCorrection(ArrayRef<const RVec> 
     const double twoBetaOverSqrtPi = 2 * beta / std::sqrt(M_PI);
     const auto   group = [&](int i) { return energyGroups.empty() ? 0 : energyGroups[i]; };
 
-    // For an ML region of thousands of atoms this is millions of pairs per step: the pairs
-    // are split over the OpenMP threads, each with its own forces, virial and energies
+    // For an ML region of thousands of atoms this is millions of pairs per step, so the
+    // pairs are split over the OpenMP threads: each thread accumulates into its own
+    // forces, virial and energies, and the loop after the region sums them up.
+    //
+    // The buffers are sized here rather than inside the region, because the team can end
+    // up smaller than the number asked for: OpenMP may be compiled out of this build, or
+    // the runtime may hand back fewer threads under OMP_THREAD_LIMIT or dynamic
+    // adjustment. The sum below visits every slot, so a slot that no thread ever reached
+    // still has to hold a valid, zero-filled buffer rather than an empty vector.
     const int                              numThreadsUsed = std::max(1, std::min(numThreads, n));
     std::vector<EmbeddedCoulombCorrection> perThread(numThreadsUsed);
+    for (auto& local : perThread)
+    {
+        local.forces.assign(n, { 0, 0, 0 });
+        local.groupPairEnergies.assign(numEnergyGroups * numEnergyGroups, 0.0);
+    }
 #pragma omp parallel num_threads(numThreadsUsed)
     {
       try
       {
         auto& local = perThread[gmx_omp_get_thread_num()];
-        local.forces.assign(n, { 0, 0, 0 });
-        local.groupPairEnergies.assign(numEnergyGroups * numEnergyGroups, 0.0);
         // Rows get shorter with i; interleave them over the threads
 #pragma omp for schedule(dynamic, 16)
         for (int i = 0; i < n; i++)
