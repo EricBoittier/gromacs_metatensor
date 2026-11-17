@@ -160,7 +160,10 @@ public:
      *
      * \p x1 is chosen such that x1 + cellShift . box - x0 = \p distance.
      */
-    void evaluate(const matrix box, const RVec& distance, const IVec& cellShift)
+    void evaluate(const matrix  box,
+                  const RVec&   distance,
+                  const IVec&   cellShift,
+                  const bool    sendRedistributedSignal = true)
     {
         const DVec shift(cellShift[XX] * box[XX][XX] + cellShift[YY] * box[YY][XX] + cellShift[ZZ] * box[ZZ][XX],
                          cellShift[YY] * box[YY][YY] + cellShift[ZZ] * box[ZZ][YY],
@@ -170,7 +173,11 @@ public:
         distance_ = x_[1].toDVec() + shift - x_[0].toDVec();
 
         MetatomicForceProvider provider(options_, logger_, mpiComm_);
-        provider.gatherAtomNumbersIndices(MDModulesAtomsRedistributedSignal(box, x_, {}, {}, std::nullopt));
+        if (sendRedistributedSignal)
+        {
+            provider.gatherAtomNumbersIndices(
+                    MDModulesAtomsRedistributedSignal(box, x_, {}, {}, std::nullopt));
+        }
         // GROMACS shifts the first atom of a pair, metatensor the second
         const std::vector<MDModulesPairlistConstructedSignal::PairlistEntry> pairlist = {
             { { 0, 1 }, xyzToShiftIndex(-cellShift[XX], -cellShift[YY], -cellShift[ZZ]) }
@@ -257,6 +264,65 @@ TEST_F(MetatomicForceProviderTest, PairAcrossTriclinicBoundary)
     setModelUnits("Angstrom", "eV");
     evaluate(box, RVec(0.21, -0.24, 0.17), IVec(1, -1, 1));
     checkAgainstLennardJones();
+}
+
+TEST_F(MetatomicForceProviderTest, WorksWithoutAnAtomsRedistributedSignal)
+{
+    // The MDModulesAtomsRedistributedSignal has two emitters: domain
+    // decomposition, and sim_util.cpp for everything else -- and the latter sits
+    // inside `if (fr->pbcType != PbcType::No)`. So a serial run with pbc = no
+    // never receives it, and the provider has to build its atom mapping itself.
+    // Every other test here calls gatherAtomNumbersIndices() by hand, which is
+    // what hid this: without the signal the mapping was empty, the pair list was
+    // indexed anyway, and the model was handed a zero-atom system.
+    setModelUnits("nm", "kJ/mol");
+    *options_.params_.pbcType_ = PbcType::No;
+    const matrix noBox         = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
+    evaluate(noBox, RVec(0.37, 0.0, 0.0), IVec(0, 0, 0), false);
+
+    EXPECT_NE(energy_, 0.0) << "the model was given no atoms";
+    checkAgainstLennardJones();
+}
+
+TEST_F(MetatomicForceProviderTest, SymmetrizesTheVirial)
+{
+    // A model which is not exactly rotationally equivariant returns a slightly
+    // non-symmetric strain gradient, and metatomic passes it through untouched.
+    // The antisymmetric part is not a virial and would reach the pressure.
+    options_.params_.modelOptions =
+            "length_unit=nm energy_unit=kJ/mol asymmetric_strain=0.25";
+    evaluate(c_cubicBox, RVec(0.37, 0.0, 0.0), IVec(0, 0, 0));
+
+    for (int a = 0; a < 3; ++a)
+    {
+        for (int b = a + 1; b < 3; ++b)
+        {
+            EXPECT_NEAR(virial_[a][b], virial_[b][a], c_tolerance * (1 + std::abs(virial_[a][b])))
+                    << "virial is not symmetric at " << a << ", " << b;
+        }
+    }
+    // the symmetric part is untouched, so the diagonal still matches the potential
+    const double r    = norm(distance_);
+    const double sr6  = std::pow(c_sigma / r, 6);
+    const double dEdr = 4 * c_epsilon * (-12 * sr6 * sr6 + 6 * sr6) / r;
+    const double xx   = -0.5 * distance_[XX] * -dEdr * distance_[XX] / r;
+    EXPECT_NEAR(xx, virial_[XX][XX], c_tolerance * std::abs(dEdr * r));
+}
+
+TEST_F(MetatomicForceProviderTest, RejectsParticleWithoutAtomicNumber)
+{
+    // 0 is the "not set" sentinel of t_atom::atomnumber, and also what grompp
+    // leaves on a particle it could not assign an element to. That is user
+    // input, so it must be an InconsistentInputError rather than an assertion.
+    setModelUnits("nm", "kJ/mol");
+    options_.params_.atoms_.atom[1].atomnumber = 0;
+    const matrix box = { { 3, 0, 0 }, { 0, 3, 0 }, { 0, 0, 3 } };
+    x_               = { RVec(0.3, 0.4, 0.5), RVec(0.67, 0.4, 0.5) };
+
+    MetatomicForceProvider provider(options_, logger_, mpiComm_);
+    EXPECT_THROW_GMX(provider.gatherAtomNumbersIndices(
+                             MDModulesAtomsRedistributedSignal(box, x_, {}, {}, std::nullopt)),
+                     InconsistentInputError);
 }
 
 TEST_F(MetatomicForceProviderTest, NonperiodicSystemWithBox)

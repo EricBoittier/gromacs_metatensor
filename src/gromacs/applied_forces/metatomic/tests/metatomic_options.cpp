@@ -127,6 +127,14 @@ public:
 
         return IndexGroupsAndNames(indexGroups);
     }
+
+    static IndexGroupsAndNames indexGroupsAndNamesWithDuplicate()
+    {
+        std::vector<IndexGroup> indexGroups;
+        indexGroups.push_back({ "System", { 1, 2, 2, 3 } });
+
+        return IndexGroupsAndNames(indexGroups);
+    }
 };
 
 TEST_F(MetatomicOptionsTest, DefaultParameters)
@@ -194,6 +202,19 @@ TEST_F(MetatomicOptionsTest, OutputDefaultValuesWhenActive)
     gmx::test::TestReferenceChecker checker(data.rootChecker());
 
     checker.checkString(stream.toString(), "Mdp output");
+}
+
+TEST_F(MetatomicOptionsTest, RejectsRepeatedInputGroupIndex)
+{
+    // The force provider builds its global -> model index map by assigning each
+    // entry in turn, so a repeated index keeps only the last of them. Under
+    // domain decomposition one slot then belongs to no rank, its position stays
+    // zero through the reduction, and a phantom atom at the origin is handed to
+    // the model on every rank.
+    MetatomicOptions metatomicOptions;
+    test::fillOptionsFromMdpValues(metatomicBuildInputMdpValues(), &metatomicOptions);
+    EXPECT_THROW_GMX(metatomicOptions.setInputGroupIndices(indexGroupsAndNamesWithDuplicate()),
+                     InconsistentInputError);
 }
 
 TEST_F(MetatomicOptionsTest, GromppChecksUncertaintyThresholdAndModelOptions)

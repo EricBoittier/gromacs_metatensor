@@ -61,12 +61,16 @@ constexpr int c_atomicNumber = 18;
 class PairModel final : public metatomic::BaseModel
 {
 public:
-    PairModel(const std::string& lengthUnit, const std::string& energyUnit, bool requestCharges) :
+    PairModel(const std::string& lengthUnit,
+              const std::string& energyUnit,
+              bool               requestCharges,
+              double             asymmetricStrain = 0.0) :
         lengthUnit_(lengthUnit),
         energyUnit_(energyUnit),
         toLength_(metatomic::unit_conversion_factor("nm", lengthUnit)),
         toEnergy_(metatomic::unit_conversion_factor("kJ/mol", energyUnit)),
         requestCharges_(requestCharges),
+        asymmetricStrain_(asymmetricStrain),
         pairs_(metatomic::PairListOptions::builder().cutoff(c_cutoff * toLength_).full_list(false).strict(false).build())
     {
     }
@@ -175,6 +179,21 @@ public:
             }
         }
 
+        // A model which is not exactly rotationally equivariant returns a strain
+        // gradient with a small antisymmetric part. Add one on request, so the
+        // engine's handling of it can be tested.
+        if (asymmetricStrain_ != 0.0)
+        {
+            for (int a = 0; a < 3; ++a)
+            {
+                for (int b = a + 1; b < 3; ++b)
+                {
+                    strainGradient[3 * a + b] += asymmetricStrain_ * toEnergy_;
+                    strainGradient[3 * b + a] -= asymmetricStrain_ * toEnergy_;
+                }
+            }
+        }
+
         auto block = metatensor::TensorBlock(
                 std::make_unique<metatensor::SimpleDataArray<double>>(std::vector<uintptr_t>{ 1, 1 },
                                                                       std::vector<double>{ energy }),
@@ -220,6 +239,7 @@ private:
     double                     toLength_;
     double                     toEnergy_;
     bool                       requestCharges_;
+    double                     asymmetricStrain_;
     metatomic::PairListOptions pairs_;
 };
 
@@ -234,9 +254,13 @@ inline mta_status_t loadPairModel(const char* loadFrom, const char* optionsJson,
     {
         const auto options = nlohmann::json::parse(optionsJson);
         *model             = metatomic::BaseModel::to_mta_model(
-                std::make_unique<PairModel>(options.at("length_unit").get<std::string>(),
-                                            options.at("energy_unit").get<std::string>(),
-                                            options.contains("request_charges")));
+                std::make_unique<PairModel>(
+                        options.at("length_unit").get<std::string>(),
+                        options.at("energy_unit").get<std::string>(),
+                        options.contains("request_charges"),
+                        options.contains("asymmetric_strain")
+                                ? std::stod(options.at("asymmetric_strain").get<std::string>())
+                                : 0.0));
         return MTA_SUCCESS;
     }
     catch (const std::exception& e)
