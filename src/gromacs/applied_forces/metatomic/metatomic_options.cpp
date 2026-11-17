@@ -356,6 +356,23 @@ void MetatomicOptions::setInputGroupIndices(const IndexGroupsAndNames& indexGrou
                 "Group %s defining metatomic potential input atoms should not be empty.",
                 params_.inputGroup.c_str())));
     }
+
+    // The force provider builds a global-index -> model-index map by assigning
+    // each entry in turn, so a repeated index silently keeps only the last of
+    // them: under domain decomposition one slot then belongs to no rank at all,
+    // its position stays zero through the reduction, and a phantom atom at the
+    // origin is handed to the model on every rank.
+    auto sorted = params_.mtaIndices_;
+    std::sort(sorted.begin(), sorted.end());
+    const auto duplicate = std::adjacent_find(sorted.begin(), sorted.end());
+    if (duplicate != sorted.end())
+    {
+        GMX_THROW(InconsistentInputError(formatString(
+                "Group %s defining metatomic potential input atoms lists atom %d more than "
+                "once. Each atom may appear only once in the metatomic input group.",
+                params_.inputGroup.c_str(),
+                static_cast<int>(*duplicate) + 1)));
+    }
 }
 
 void MetatomicOptions::modifyTopology(gmx_mtop_t* top)

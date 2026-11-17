@@ -736,26 +736,7 @@ void MetatomicForceProvider::gatherAtomNumbersIndices(const MDModulesAtomsRedist
     }
     else
     {
-        // Serial / thread-MPI: all MTA atoms are home, no halos
-        const auto* mtaAtoms = options_.params_.mtaAtoms_.get();
-        numHomeMta_  = numTotalMta;
-        numLocalMta_ = numTotalMta;
-
-        mtaToGmxLocal_.resize(numTotalMta);
-        mtaToGlobalMta_.resize(numTotalMta);
-        atomNumbers_.resize(numTotalMta);
-        gmxLocalToMtaIdx_.assign(signal.x_.size(), -1);
-
-        for (int32_t i = 0; i < numTotalMta; i++)
-        {
-            int32_t localIndex = mtaAtoms->localIndex()[i];
-            int32_t globalIdx  = mtaAtoms->globalIndex()[mtaAtoms->collectiveIndex()[i]];
-
-            mtaToGmxLocal_[i]       = localIndex;
-            mtaToGlobalMta_[i]      = i;
-            atomNumbers_[i]         = options_.params_.atoms_.atom[globalIdx].atomnumber;
-            gmxLocalToMtaIdx_[localIndex] = i;
-        }
+        buildSerialAtomMapping(signal.x_.size());
     }
 
     // Build reverse map: global MTA index -> local home model index.
@@ -766,8 +747,74 @@ void MetatomicForceProvider::gatherAtomNumbersIndices(const MDModulesAtomsRedist
         globalMtaToLocalHome_[mtaToGlobalMta_[i]] = i;
     }
 
-    GMX_RELEASE_ASSERT(std::count(atomNumbers_.begin(), atomNumbers_.end(), 0) == 0,
-                       "Some atom numbers not set.");
+    checkAtomNumbers();
+}
+
+void MetatomicForceProvider::checkAtomNumbers() const
+{
+    // 0 is the "not set" sentinel of t_atom::atomnumber, and it is also what
+    // grompp leaves on a particle it could not assign an element to -- a virtual
+    // site, a shell, a dummy. That is user input, so name the atom instead of
+    // aborting on an assertion.
+    for (size_t i = 0; i < atomNumbers_.size(); i++)
+    {
+        if (atomNumbers_[i] == 0)
+        {
+            const int32_t gmxLocal = mtaToGmxLocal_[i];
+            GMX_THROW(InconsistentInputError(formatString(
+                    "The metatomic input group contains a particle with no atomic number "
+                    "(local index %d). Particles without an element, such as virtual sites "
+                    "or shells, cannot be passed to a metatomic model: remove them from the "
+                    "metatomic-input-group.",
+                    gmxLocal)));
+        }
+    }
+}
+
+void MetatomicForceProvider::buildSerialAtomMapping(size_t numLocalAtoms)
+{
+    // Serial / thread-MPI: all MTA atoms are home, no halos.
+    const int32_t numTotalMta = static_cast<int32_t>(options_.params_.mtaIndices_.size());
+    const auto*   mtaAtoms    = options_.params_.mtaAtoms_.get();
+
+    numHomeMta_  = numTotalMta;
+    numLocalMta_ = numTotalMta;
+
+    mtaToGmxLocal_.resize(numTotalMta);
+    mtaToGlobalMta_.resize(numTotalMta);
+    atomNumbers_.resize(numTotalMta);
+    gmxLocalToMtaIdx_.assign(numLocalAtoms, -1);
+
+    for (int32_t i = 0; i < numTotalMta; i++)
+    {
+        int32_t localIndex = mtaAtoms->localIndex()[i];
+        int32_t globalIdx  = mtaAtoms->globalIndex()[mtaAtoms->collectiveIndex()[i]];
+
+        mtaToGmxLocal_[i]             = localIndex;
+        mtaToGlobalMta_[i]            = i;
+        atomNumbers_[i]               = options_.params_.atoms_.atom[globalIdx].atomnumber;
+        gmxLocalToMtaIdx_[localIndex] = i;
+    }
+
+    globalMtaToLocalHome_.clear();
+    for (int32_t i = 0; i < numHomeMta_; i++)
+    {
+        globalMtaToLocalHome_[mtaToGlobalMta_[i]] = i;
+    }
+
+    checkAtomNumbers();
+}
+
+void MetatomicForceProvider::ensureSerialAtomMapping()
+{
+    // The MDModulesAtomsRedistributedSignal is only emitted from sim_util.cpp
+    // inside `if (fr->pbcType != PbcType::No)`, so a serial run with pbc = no
+    // never receives it. Without this, gmxLocalToMtaIdx_ would still be empty
+    // when the pair list arrives, and the model would be handed an empty system.
+    if (!mpiComm_.isParallel() && gmxLocalToMtaIdx_.empty())
+    {
+        buildSerialAtomMapping(static_cast<size_t>(options_.params_.numAtoms_));
+    }
 }
 
 void MetatomicForceProvider::gatherAtomPositions(ArrayRef<const RVec> pos)
@@ -792,6 +839,8 @@ void MetatomicForceProvider::gatherAtomPositions(ArrayRef<const RVec> pos)
  */
 void MetatomicForceProvider::setPairlist(const MDModulesPairlistConstructedSignal& signal)
 {
+    ensureSerialAtomMapping();
+
     pairlistMta_.clear();
     cellShiftsMta_.clear();
 
@@ -805,6 +854,16 @@ void MetatomicForceProvider::setPairlist(const MDModulesPairlistConstructedSigna
         for (const auto& entry : pairlistEntries)
         {
             const auto& [atomPair, shiftIndex] = entry;
+            const int numLocal = static_cast<int>(gmxLocalToMtaIdx_.size());
+            if (atomPair.first >= numLocal || atomPair.second >= numLocal)
+            {
+                GMX_THROW(InternalError(formatString(
+                        "Metatomic received a pair (%d, %d) outside the %d local atoms it "
+                        "knows about; the atom mapping and the pair list disagree.",
+                        atomPair.first,
+                        atomPair.second,
+                        numLocal)));
+            }
             const int32_t idxA = gmxLocalToMtaIdx_[atomPair.first];
             const int32_t idxB = gmxLocalToMtaIdx_[atomPair.second];
 
@@ -1092,6 +1151,7 @@ void MetatomicForceProvider::distributeNonHomeForces(const double*        forces
 
 void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, ForceProviderOutput* outputs)
 {
+    ensureSerialAtomMapping();
     gatherAtomPositions(inputs.x_);
     copy_mat(inputs.box_, box_);
     // metatomic requires zero cell vectors along nonperiodic directions.
@@ -1252,6 +1312,14 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
             nlSamplesBuffer_.resize(static_cast<size_t>(nPairs) * 5);
             nlVectorsBuffer_.resize(static_cast<size_t>(nPairs) * 3);
 
+            // NOTE: metatensor::assume_unique{} would skip the hashing of all
+            // 5*nPairs entries that runs here on every pair-list request on every
+            // step, but it is not safe yet: mtaToGmxLocal_ keeps only the first
+            // local image of an atom, so two pairs that differ only in which
+            // image of the second atom they name collapse to the same
+            // (first_atom, second_atom, cell_shift) row. The checked constructor
+            // turns that into an exception; the unchecked one would make it
+            // undefined behaviour.
             auto samples = metatensor::Labels(
                     data_->nlSampleNames,
                     nPairs == 0 ? nullptr : nlSamplesBuffer_.data(),
@@ -1469,7 +1537,20 @@ void MetatomicForceProvider::calculateForces(const ForceProviderInput& inputs, F
     }
 
     outputs->enerd_.term[InteractionFunction::MetatomicPotentialEnergy] = static_cast<real>(energy);
-    outputs->forceWithVirial_.addVirialContribution(virialMatrix);
+
+    // Models that are not exactly rotationally equivariant return a slightly
+    // non-symmetric strain gradient, and metatomic passes it through untouched.
+    // Keep its symmetric part, as the i-PI driver does: the antisymmetric part
+    // is not a virial and would reach the pressure and any barostat.
+    matrix symmetricVirial;
+    for (int i = 0; i < DIM; i++)
+    {
+        for (int j = 0; j < DIM; j++)
+        {
+            symmetricVirial[i][j] = 0.5 * (virialMatrix[i][j] + virialMatrix[j][i]);
+        }
+    }
+    outputs->forceWithVirial_.addVirialContribution(symmetricVirial);
 }
 
 } // namespace gmx

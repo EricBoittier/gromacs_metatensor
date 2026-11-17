@@ -113,6 +113,19 @@ public:
     //! Gather atom numbers and indices. Triggered on AtomsRedistributed signal.
     void gatherAtomNumbersIndices(const MDModulesAtomsRedistributedSignal& signal);
 
+    /*! \brief Build the home-only atom mapping used by serial runs.
+     *
+     * \param numLocalAtoms size of the local position buffer, which the mapping
+     *                      from GROMACS local indices is sized by.
+     */
+    void buildSerialAtomMapping(size_t numLocalAtoms);
+
+    //! Build the serial mapping if no MDModulesAtomsRedistributedSignal arrived.
+    void ensureSerialAtomMapping();
+
+    //! Throw if any selected particle has no atomic number.
+    void checkAtomNumbers() const;
+
     //! Store GROMACS pairlist and convert to MTA model indices.
     void setPairlist(const MDModulesPairlistConstructedSignal& signal);
 
